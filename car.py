@@ -66,6 +66,8 @@ class Car:
         # rewards (per-step for PPO)
         self.step_reward = 0.0
         self.prev_dist_to_cp = self._dist_to_next_cp()
+        self.prev_angle = self.angle
+        self.total_spin = 0.0
 
         # radar data
         self.radar_data = [0.0] * self.NUM_RADARS
@@ -101,9 +103,9 @@ class Car:
 
         self.speed = max(0.0, min(self.speed, self.max_speed))
 
-        # steering (proportional to speed ratio)
+        # steering (proportional to speed -- can't turn much when slow)
         ratio = self.speed / self.max_speed if self.max_speed > 0 else 0
-        self.angle += self.turn_rate * steering * max(0.2, ratio)
+        self.angle += self.turn_rate * steering * max(0.05, ratio)
 
         # friction
         self.speed *= (1 - self.friction)
@@ -167,6 +169,18 @@ class Car:
         min_radar = min(self.radar_data)
         if min_radar < 0.15:
             reward -= 0.2 * (0.15 - min_radar) / 0.15
+
+        # penalty for excessive spinning / constant turning
+        angle_delta = abs(self.angle - self.prev_angle)
+        self.total_spin += angle_delta
+        self.prev_angle = self.angle
+        if angle_delta > 3.0:
+            reward -= 0.15 * (angle_delta / self.turn_rate)
+        # penalty for accumulated spin (going in circles)
+        if self.ticks > 0 and self.ticks % 60 == 0:
+            avg_spin = self.total_spin / self.ticks
+            if avg_spin > 2.5:
+                reward -= 0.3
 
         # penalty for very low speed
         if self.speed < 0.5:

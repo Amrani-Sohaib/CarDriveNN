@@ -208,6 +208,8 @@ class GUI:
             ("Entropy",  f"{st.get('entropy', 0):.4f}",  PPO_GREEN),
             ("Updates",  f"{st.get('total_updates', 0)}", TEXT_DIM),
             ("LR",       f"{st.get('lr', 3e-4):.1e}",    TEXT_DIM),
+            ("Step",     f"{st.get('global_step', 0):,}", TEXT_DIM),
+            ("Device",   f"{st.get('device', 'cpu')}",   PPO_BLUE),
         ]
         for label, val, col in ppo_rows:
             self._blit(self.screen, self.font_xs, label, TEXT_DIM, x, y)

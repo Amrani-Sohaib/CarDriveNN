@@ -5,12 +5,14 @@ A single car learns to drive via Proximal Policy Optimization.
 Architecture: In(15) > FC(128)x2 > LSTM(128) > Actor(2) + Critic(1)
 
 Inputs:  12 radars + speed + angle_to_checkpoint + curvature
-Outputs: steering [-1,+1] + throttle [-1,+1]  (continuous)
+Outputs: steering [-1,+1] + throttle [-1,+1]  (continuous, SquashedNormal)
 
 Modes:
-  python main.py              -- Train mode (PPO)
-  python main.py --test       -- Test the saved model
-  python main.py --test model.json  -- Test a specific model
+  python main.py                        -- Train (new run)
+  python main.py --resume               -- Resume from default checkpoint
+  python main.py --checkpoint path.pt   -- Resume from specific checkpoint
+  python main.py --test                 -- Test the saved model
+  python main.py --test model.pt        -- Test a specific model
 
 Controls:
   SPACE   -- Pause / Resume
@@ -20,26 +22,28 @@ Controls:
   Up/Down -- Simulation speed
   ESC     -- Quit
 """
-import sys, os
+import sys
+import os
+import argparse
 import numpy as np
 from track import Track, LEVEL_NAMES, TEST_TRACK_NAMES
 from car import Car
-from brain import ActorCriticLSTM, PPOTrainer
+from brain import ActorCriticLSTM, PPOTrainer, DEVICE
 from gui import GUI, TRACK_W, TRACK_H
 
 LAPS_TO_ADVANCE = 2
-MAX_LEVEL       = 5
-MODELS_DIR      = "models"
-DEFAULT_MODEL   = os.path.join(MODELS_DIR, "best_model.json")
+MAX_LEVEL = 5
+MODELS_DIR = "models"
+DEFAULT_CHECKPOINT = os.path.join(MODELS_DIR, "checkpoint.pt")
 NUM_TEST_TRACKS = 3
-ROLLOUT_LEN     = 2048   # steps before PPO update
+ROLLOUT_LEN = 2048  # steps before PPO update
 
 
 # =========================================================================
 #  TRAIN MODE (PPO)
 # =========================================================================
 class TrainSimulation:
-    def __init__(self):
+    def __init__(self, resume_path=None):
         self.gui = GUI(test_mode=False)
         self.level = 1
         self.track = Track(TRACK_W, TRACK_H, level=self.level)
@@ -48,20 +52,29 @@ class TrainSimulation:
         self.trainer = PPOTrainer(self.network)
         self.running = True
 
+        # resume from checkpoint if requested
+        if resume_path and os.path.exists(resume_path):
+            self.trainer.load_checkpoint(resume_path)
+            print(f"  Resumed from {resume_path}")
+        elif resume_path:
+            print(f"  Checkpoint not found: {resume_path}")
+            print("  Starting fresh training run.")
+
     def run(self):
         print("=" * 60)
         print("  CarAI -- PPO Training Mode")
         print(f"  Architecture : {self.network.get_architecture_str()}")
         print(f"  Parameters   : {self.network.count_params():,}")
-        print(f"  Method       : PPO + LSTM + Continuous Actions")
+        print(f"  Device       : {DEVICE}")
+        print(f"  Method       : PPO + LSTM + SquashedNormal")
         print(f"  Rollout      : {ROLLOUT_LEN} steps")
+        print(f"  Obs Norm     : Welford running normaliser")
         print("=" * 60)
         print(f"  Level 1 : {LEVEL_NAMES[0]}")
         print("  SPACE=Pause  R=Radars  S=Save  Up/Down=Speed  ESC=Quit")
         print("=" * 60)
 
         self.network.train()
-        global_step = 0
 
         while self.running:
             self.trainer.episode += 1
@@ -78,11 +91,13 @@ class TrainSimulation:
 
                 if self.gui.save_requested:
                     self.gui.save_requested = False
-                    path = self.trainer.save(DEFAULT_MODEL)
+                    path = self.trainer.save(DEFAULT_CHECKPOINT)
                     print(f"  >> Model saved -> {path}")
 
                 if self.gui.paused:
-                    acts = self.network.get_activations(car.get_inputs(), hidden)
+                    obs_raw = car.get_inputs()
+                    obs_norm = self.trainer.obs_normalizer.normalize(obs_raw)
+                    acts = self.network.get_activations(obs_norm, hidden)
                     stats = self._stats(car)
                     self.gui.draw(self.track, car, stats, self.network, acts)
                     continue
@@ -91,25 +106,52 @@ class TrainSimulation:
                     if not car.alive:
                         break
 
-                    obs = car.get_inputs()
-                    action, log_prob, value, new_hidden = self.network.act(obs, hidden)
+                    obs_raw = car.get_inputs()
+                    # update normaliser & normalise
+                    self.trainer.obs_normalizer.update(obs_raw)
+                    obs = self.trainer.obs_normalizer.normalize(obs_raw)
+
+                    # store hidden *before* the step
+                    hidden_before = (
+                        hidden[0].clone(),
+                        hidden[1].clone(),
+                    )
+
+                    action, log_prob, value, new_hidden, pre_tanh = (
+                        self.network.act(obs, hidden)
+                    )
 
                     car.apply_action(action)
                     car.update()
                     episode_ticks += 1
-                    global_step += 1
+                    self.trainer.global_step += 1
 
                     reward = car.step_reward
                     done = not car.alive
                     episode_reward += reward
 
-                    self.trainer.buffer.push(obs, action, log_prob, reward, value, float(done))
+                    self.trainer.buffer.push(
+                        obs,
+                        action,
+                        pre_tanh,
+                        log_prob,
+                        reward,
+                        value,
+                        float(done),
+                        hidden_before,
+                    )
                     hidden = new_hidden
 
-                    # PPO update
+                    # PPO update when buffer is full
                     if len(self.trainer.buffer) >= ROLLOUT_LEN:
                         if car.alive:
-                            last_val = self.network.get_value(car.get_inputs(), hidden)
+                            obs_next = car.get_inputs()
+                            obs_next_n = self.trainer.obs_normalizer.normalize(
+                                obs_next
+                            )
+                            last_val = self.network.get_value(
+                                obs_next_n, hidden
+                            )
                         else:
                             last_val = 0.0
                         self.trainer.update(last_val)
@@ -122,7 +164,9 @@ class TrainSimulation:
                     break
 
                 if car.alive:
-                    acts = self.network.get_activations(car.get_inputs(), hidden)
+                    obs_raw = car.get_inputs()
+                    obs_norm = self.trainer.obs_normalizer.normalize(obs_raw)
+                    acts = self.network.get_activations(obs_norm, hidden)
                 else:
                     acts = None
                 stats = self._stats(car)
@@ -131,7 +175,9 @@ class TrainSimulation:
             # end of episode: flush remaining buffer
             if len(self.trainer.buffer) > 0:
                 if car.alive:
-                    last_val = self.network.get_value(car.get_inputs(), hidden)
+                    obs_raw = car.get_inputs()
+                    obs_n = self.trainer.obs_normalizer.normalize(obs_raw)
+                    last_val = self.network.get_value(obs_n, hidden)
                 else:
                     last_val = 0.0
                 self.trainer.update(last_val)
@@ -162,15 +208,15 @@ class TrainSimulation:
 
             # auto-save every 25 episodes
             if ep % 25 == 0:
-                self.trainer.save(DEFAULT_MODEL)
+                self.trainer.save(DEFAULT_CHECKPOINT)
 
         # auto-save on quit
-        path = self.trainer.save(DEFAULT_MODEL)
+        path = self.trainer.save(DEFAULT_CHECKPOINT)
         print(f"\n  Auto-saved model -> {path}")
         self.gui.quit()
 
     def _advance_level(self):
-        path = self.trainer.save(DEFAULT_MODEL)
+        path = self.trainer.save(DEFAULT_CHECKPOINT)
         print(f"  >> Model saved on level completion -> {path}")
 
         if self.level < MAX_LEVEL:
@@ -202,7 +248,9 @@ class TestSimulation:
     def __init__(self, model_path: str):
         self.model_path = model_path
         self.gui = GUI(test_mode=True)
-        self.network, self.model_info = PPOTrainer.load(model_path)
+        self.network, self.model_info, self.obs_normalizer = (
+            PPOTrainer.load_for_test(model_path)
+        )
         self.network.eval()
 
         self.test_id = 1
@@ -216,6 +264,7 @@ class TestSimulation:
         print("  CarAI -- Test Mode (PPO + LSTM)")
         print(f"  Model        : {self.model_path}")
         print(f"  Architecture : {self.network.get_architecture_str()}")
+        print(f"  Device       : {DEVICE}")
         print(f"  Trained ep.  : {info.get('episode', '?')}")
         print(f"  Train fitness: {info.get('best_fitness', '?'):.0f}")
         print("=" * 60)
@@ -238,6 +287,8 @@ class TestSimulation:
         print(f"\n  >> Switched to {self.track.level_name}")
 
     def _run_test_episode(self):
+        import pygame
+
         self.attempt += 1
         car = Car(self.track)
         hidden = self.network.init_hidden()
@@ -256,23 +307,32 @@ class TestSimulation:
                 return
 
             if self.gui.paused:
-                acts = self.network.get_activations(car.get_inputs(), hidden)
+                obs_raw = car.get_inputs()
+                obs_norm = self.obs_normalizer.normalize(obs_raw)
+                acts = self.network.get_activations(obs_norm, hidden)
                 stats = self._test_stats(car)
-                self.gui.draw(self.track, car, stats, self.network, acts)
+                self.gui.draw(
+                    self.track, car, stats, self.network, acts
+                )
                 continue
 
             for _ in range(self.gui.speed):
                 if not car.alive:
                     break
                 tick += 1
-                obs = car.get_inputs()
-                action, _, new_hidden = self.network.act_deterministic(obs, hidden)
+                obs_raw = car.get_inputs()
+                obs_norm = self.obs_normalizer.normalize(obs_raw)
+                action, _, new_hidden = self.network.act_deterministic(
+                    obs_norm, hidden
+                )
                 hidden = new_hidden
                 car.apply_action(action)
                 car.update()
 
             if car.alive:
-                acts = self.network.get_activations(car.get_inputs(), hidden)
+                obs_raw = car.get_inputs()
+                obs_norm = self.obs_normalizer.normalize(obs_raw)
+                acts = self.network.get_activations(obs_norm, hidden)
             else:
                 acts = None
             stats = self._test_stats(car)
@@ -301,29 +361,55 @@ class TestSimulation:
             "lr": 0.0,
             "level": self.test_id,
             "level_name": self.track.level_name,
+            "global_step": self.model_info.get("global_step", 0),
+            "device": str(DEVICE),
         }
 
 
 # =========================================================================
 #  ENTRY POINT
 # =========================================================================
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="CarAI -- PPO + LSTM self-driving car"
+    )
+    parser.add_argument(
+        "--test",
+        nargs="?",
+        const=DEFAULT_CHECKPOINT,
+        default=None,
+        help="Run in test mode. Optionally specify a model path.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from the default checkpoint.",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path to a specific checkpoint to resume from.",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
     import pygame
 
-    args = sys.argv[1:]
+    args = parse_args()
 
-    if "--test" in args:
-        idx = args.index("--test")
-        if idx + 1 < len(args) and not args[idx + 1].startswith("-"):
-            model_path = args[idx + 1]
-        else:
-            model_path = DEFAULT_MODEL
-
+    if args.test is not None:
+        model_path = args.test
         if not os.path.exists(model_path):
             print(f"  Error: model file not found: {model_path}")
-            print(f"  Train first with: python main.py")
+            print("  Train first with: python main.py")
             sys.exit(1)
-
         TestSimulation(model_path).run()
     else:
-        TrainSimulation().run()
+        resume_path = None
+        if args.checkpoint:
+            resume_path = args.checkpoint
+        elif args.resume:
+            resume_path = DEFAULT_CHECKPOINT
+        TrainSimulation(resume_path=resume_path).run()
