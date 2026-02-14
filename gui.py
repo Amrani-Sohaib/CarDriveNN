@@ -1,8 +1,14 @@
 """
-GUI module -- Two compact windows side-by-side:
-  Window 1 (left):  Track + Car + Stats panel
-  Window 2 (right): Dedicated NN Visualization
-Adapted for LSTM + PPO + continuous actions.
+GUI module -- Two resizable, HiDPI-aware windows:
+  Window 1 (left):  Track + Car + Stats panel   (resizable)
+  Window 2 (right): Dedicated NN Visualisation   (resizable)
+
+Everything is driven by a scale factor S  (default 1.0).
+  - S controls font sizes, paddings, bar thicknesses, etc.
+  - The track is rendered onto an off-screen surface at its native 900x620
+    then blitted/scaled into the track area of the window.
+  - When the user resizes a window, S is recomputed so the layout fills it.
+  - On 4K / Retina screens the initial S is auto-detected to ~2.0.
 """
 import math
 import pygame
@@ -41,38 +47,66 @@ INPUT_LABELS = [
 
 OUTPUT_LABELS = ["Steer", "Throttle"]
 
-# -- Layout constants ------------------------------------------------------
-TRACK_W, TRACK_H = 900, 620
-PANEL_W = 220
-WIN1_W  = TRACK_W + PANEL_W   # 1120
-WIN1_H  = TRACK_H             # 620
-NN_WIN_W, NN_WIN_H = 560, 620
+# -- Base (1x) logical dimensions -----------------------------------------
+BASE_TRACK_W, BASE_TRACK_H = 900, 620
+BASE_PANEL_W = 220
+BASE_WIN1_W  = BASE_TRACK_W + BASE_PANEL_W  # 1120
+BASE_WIN1_H  = BASE_TRACK_H                 # 620
+BASE_NN_W, BASE_NN_H = 560, 620
+
+# Exported for main.py  (track is always built at this fixed size)
+TRACK_W, TRACK_H = BASE_TRACK_W, BASE_TRACK_H
+
+
+# -- helpers ---------------------------------------------------------------
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def _detect_initial_scale():
+    """Pick a good starting scale based on desktop resolution."""
+    try:
+        info = pygame.display.Info()
+        dw = info.current_w
+        if dw >= 3840:
+            return 2.0
+        if dw >= 2560:
+            return 1.5
+        return 1.0
+    except Exception:
+        return 1.0
 
 
 class GUI:
-    """Compact dual-window GUI for LSTM-PPO."""
+    """Resizable, HiDPI-aware dual-window GUI for LSTM-PPO."""
 
+    # -------------------------------------------------------------------
     def __init__(self, test_mode=False):
         pygame.init()
         self.test_mode = test_mode
+
+        # initial scale factor
+        self._s = _detect_initial_scale()
+
+        # ---- Window 1 (pygame main window -- resizable) ----
+        w1w = int(BASE_WIN1_W * self._s)
+        w1h = int(BASE_WIN1_H * self._s)
         title = "CarAI -- Test" if test_mode else "CarAI -- Track"
         pygame.display.set_caption(title)
-        self.screen = pygame.display.set_mode((WIN1_W, WIN1_H))
+        self.screen = pygame.display.set_mode((w1w, w1h), pygame.RESIZABLE)
         self.clock = pygame.time.Clock()
 
-        # second window
-        self.nn_w, self.nn_h = NN_WIN_W, NN_WIN_H
+        # off-screen track surface at native resolution
+        self.track_surface = pygame.Surface((BASE_TRACK_W, BASE_TRACK_H))
+
+        # ---- Window 2 (SDL2 window -- resizable) ----
+        self._nn_s = self._s  # independent scale for NN window
         self._create_nn_window()
 
-        # fonts
-        self.font_title = pygame.font.SysFont("Menlo", 18, bold=True)
-        self.font_md    = pygame.font.SysFont("Menlo", 13, bold=True)
-        self.font_sm    = pygame.font.SysFont("Menlo", 11)
-        self.font_xs    = pygame.font.SysFont("Menlo", 10)
-        self.font_nn    = pygame.font.SysFont("Menlo", 11, bold=True)
-        self.font_nn_sm = pygame.font.SysFont("Menlo", 9)
+        # build fonts at current scale
+        self._rebuild_fonts(self._s)
+        self._rebuild_nn_fonts(self._nn_s)
 
-        self.panel_rect = pygame.Rect(TRACK_W, 0, PANEL_W, WIN1_H)
         self.fps = 60
         self.show_radars = True
         self.paused = False
@@ -83,50 +117,119 @@ class GUI:
         self.hist_fit  = []
         self.hist_best = []
 
+    # -------------------------------------------------------------------
+    #  Font factories
+    # -------------------------------------------------------------------
+    def _rebuild_fonts(self, s):
+        """Rebuild main-window fonts at scale *s*."""
+        self._font_title = pygame.font.SysFont("Menlo", max(8, int(18 * s)), bold=True)
+        self._font_md    = pygame.font.SysFont("Menlo", max(7, int(13 * s)), bold=True)
+        self._font_sm    = pygame.font.SysFont("Menlo", max(7, int(11 * s)))
+        self._font_xs    = pygame.font.SysFont("Menlo", max(6, int(10 * s)))
+        self._font_nn_sm_main = pygame.font.SysFont("Menlo", max(6, int(9 * s)))
+
+    def _rebuild_nn_fonts(self, s):
+        """Rebuild NN-window fonts at scale *s*."""
+        self._nn_font_title = pygame.font.SysFont("Menlo", max(8, int(18 * s)), bold=True)
+        self._nn_font_md    = pygame.font.SysFont("Menlo", max(7, int(13 * s)), bold=True)
+        self._nn_font_sm    = pygame.font.SysFont("Menlo", max(7, int(11 * s)))
+        self._nn_font_xs    = pygame.font.SysFont("Menlo", max(6, int(10 * s)))
+        self._nn_font_nn    = pygame.font.SysFont("Menlo", max(7, int(11 * s)), bold=True)
+        self._nn_font_nn_sm = pygame.font.SysFont("Menlo", max(6, int(9 * s)))
+
+    # -------------------------------------------------------------------
     def _create_nn_window(self):
         try:
+            nn_w = int(BASE_NN_W * self._nn_s)
+            nn_h = int(BASE_NN_H * self._nn_s)
             self.nn_sdl_window = SDLWindow(
                 "CarAI -- Neural Network (LSTM)",
-                size=(self.nn_w, self.nn_h),
+                size=(nn_w, nn_h),
+                resizable=True,
             )
             self.nn_renderer = Renderer(self.nn_sdl_window)
-            self.nn_buffer = pygame.Surface((self.nn_w, self.nn_h))
             self.has_nn_window = True
         except Exception:
             self.has_nn_window = False
-            self.nn_buffer = pygame.Surface((self.nn_w, self.nn_h))
 
-    # -- events ------------------------------------------------------------
+    # -------------------------------------------------------------------
+    #  Events
+    # -------------------------------------------------------------------
     def handle_events(self):
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
                 return False
+            if ev.type == pygame.VIDEORESIZE:
+                w, h = max(400, ev.w), max(300, ev.h)
+                self.screen = pygame.display.set_mode((w, h), pygame.RESIZABLE)
+                self._s = h / BASE_WIN1_H
+                self._rebuild_fonts(self._s)
             if ev.type == pygame.KEYDOWN:
-                if ev.key == pygame.K_ESCAPE:  return False
-                if ev.key == pygame.K_r:       self.show_radars = not self.show_radars
-                if ev.key == pygame.K_SPACE:   self.paused = not self.paused
-                if ev.key == pygame.K_UP:      self.speed = min(20, self.speed + 1)
-                if ev.key == pygame.K_DOWN:    self.speed = max(1, self.speed - 1)
+                if ev.key == pygame.K_ESCAPE:
+                    return False
+                if ev.key == pygame.K_r:
+                    self.show_radars = not self.show_radars
+                if ev.key == pygame.K_SPACE:
+                    self.paused = not self.paused
+                if ev.key == pygame.K_UP:
+                    self.speed = min(20, self.speed + 1)
+                if ev.key == pygame.K_DOWN:
+                    self.speed = max(1, self.speed - 1)
                 if ev.key == pygame.K_s and not self.test_mode:
                     self.save_requested = True
                     self.save_flash = 90
+
+        # poll NN window size
+        if self.has_nn_window:
+            try:
+                sz = self.nn_sdl_window.size
+                new_s = sz[1] / BASE_NN_H
+                if abs(new_s - self._nn_s) > 0.02:
+                    self._nn_s = new_s
+                    self._rebuild_nn_fonts(self._nn_s)
+            except Exception:
+                pass
         return True
 
-    # -- main draw ---------------------------------------------------------
+    # -------------------------------------------------------------------
+    #  Main draw
+    # -------------------------------------------------------------------
     def draw(self, track, car, stats, network=None, activations=None):
+        s = self._s
+        win_w, win_h = self.screen.get_size()
+
         self.screen.fill(BG)
 
-        # track area
-        clip = pygame.Rect(0, 0, TRACK_W, TRACK_H)
-        self.screen.set_clip(clip)
-        track.draw(self.screen)
-        track.draw_checkpoints(self.screen)
-        if car:
-            car.draw(self.screen, show_radars=self.show_radars)
-        self.screen.set_clip(None)
+        # --- track area: draw track at its native res then scale ---------
+        track_area_w = int(win_w - BASE_PANEL_W * s)
+        track_area_h = win_h
 
-        # panel
-        self._panel(car, stats)
+        self.track_surface.fill(BG)
+        track.draw(self.track_surface)
+        track.draw_checkpoints(self.track_surface)
+        if car:
+            car.draw(self.track_surface, show_radars=self.show_radars)
+
+        scaled_track = pygame.transform.smoothscale(
+            self.track_surface, (max(1, track_area_w), max(1, track_area_h))
+        )
+        self.screen.blit(scaled_track, (0, 0))
+
+        # --- panel -------------------------------------------------------
+        panel_w = int(BASE_PANEL_W * s)
+        panel_x = win_w - panel_w
+        self._panel(panel_x, panel_w, win_h, car, stats, s)
+
+        # save flash
+        if self.save_flash > 0:
+            self.save_flash -= 1
+            alpha = min(255, self.save_flash * 4)
+            flash_s = pygame.Surface((track_area_w, int(30 * s)), pygame.SRCALPHA)
+            flash_s.fill((0, 180, 80, min(200, alpha)))
+            self.screen.blit(flash_s, (0, 0))
+            self._blit(self.screen, self._font_md, "Model saved!",
+                       (255, 255, 255), int(10 * s), int(6 * s))
+
         pygame.display.flip()
 
         # NN window
@@ -136,16 +239,14 @@ class GUI:
         self.clock.tick(self.fps)
 
     # =====================================================================
-    #  PANEL
+    #  PANEL  (drawn directly on self.screen)
     # =====================================================================
-    def _panel(self, car, st):
-        px = TRACK_W
-        pw = PANEL_W
-        ph = WIN1_H
-        pad = 8
+    def _panel(self, px, pw, ph, car, st, s):
+        pad = int(8 * s)
 
-        pygame.draw.rect(self.screen, PANEL_BG, self.panel_rect)
-        pygame.draw.line(self.screen, ACCENT, (px, 0), (px, ph), 2)
+        panel_rect = pygame.Rect(px, 0, pw, ph)
+        pygame.draw.rect(self.screen, PANEL_BG, panel_rect)
+        pygame.draw.line(self.screen, ACCENT, (px, 0), (px, ph), max(1, int(2 * s)))
 
         x = px + pad
         right = px + pw - pad
@@ -153,22 +254,24 @@ class GUI:
         y = pad
 
         # title
-        self._blit(self.screen, self.font_title, "CarAI", ACCENT, x, y)
-        self._blit(self.screen, self.font_nn_sm, "PPO+LSTM", PPO_BLUE, x + 60, y + 5)
-        y += 22
-        self._hsep(x, y, usable); y += 6
+        self._blit(self.screen, self._font_title, "CarAI", ACCENT, x, y)
+        self._blit(self.screen, self._font_nn_sm_main, "PPO+LSTM", PPO_BLUE,
+                   x + int(60 * s), y + int(5 * s))
+        y += int(22 * s)
+        self._hsep(self.screen, x, y, usable); y += int(6 * s)
 
         # level
         level = st.get("level", 1)
         lname = st.get("level_name", "")
-        self._blit(self.screen, self.font_sm, lname, GOLD, x, y); y += 16
-        bw = (usable - 4 * 3) // 5
+        self._blit(self.screen, self._font_sm, lname, GOLD, x, y)
+        y += int(16 * s)
+        bw = (usable - int(4 * 3 * s)) // 5
         for i in range(5):
-            r = pygame.Rect(x + i * (bw + 3), y, bw, 8)
+            r = pygame.Rect(x + i * (bw + int(3 * s)), y, bw, int(8 * s))
             c = LEVEL_COLORS[i] if i < level else (35, 35, 48)
-            pygame.draw.rect(self.screen, c, r, border_radius=2)
-        y += 16
-        self._hsep(x, y, usable); y += 6
+            pygame.draw.rect(self.screen, c, r, border_radius=max(1, int(2 * s)))
+        y += int(16 * s)
+        self._hsep(self.screen, x, y, usable); y += int(6 * s)
 
         # stats
         ep     = st.get("episode", 0)
@@ -190,18 +293,19 @@ class GUI:
             ("Params",    f"{npar:,}",      TEXT_DIM),
             ("Speed",     f"x{self.speed}", TEXT),
         ]
-
+        lh = int(15 * s)
         for label, val, col in stat_rows:
-            self._blit(self.screen, self.font_xs, label, TEXT_DIM, x, y)
-            vr = self.font_xs.render(val, True, col)
+            self._blit(self.screen, self._font_xs, label, TEXT_DIM, x, y)
+            vr = self._font_xs.render(val, True, col)
             self.screen.blit(vr, (right - vr.get_width(), y))
-            y += 15
+            y += lh
 
-        y += 4
-        self._hsep(x, y, usable); y += 6
+        y += int(4 * s)
+        self._hsep(self.screen, x, y, usable); y += int(6 * s)
 
         # PPO stats
-        self._blit(self.screen, self.font_md, "PPO", PPO_BLUE, x, y); y += 16
+        self._blit(self.screen, self._font_md, "PPO", PPO_BLUE, x, y)
+        y += int(16 * s)
         ppo_rows = [
             ("PG Loss",  f"{st.get('pg_loss', 0):.4f}",  PPO_RED),
             ("V Loss",   f"{st.get('v_loss', 0):.4f}",   PPO_RED),
@@ -211,18 +315,20 @@ class GUI:
             ("Step",     f"{st.get('global_step', 0):,}", TEXT_DIM),
             ("Device",   f"{st.get('device', 'cpu')}",   PPO_BLUE),
         ]
+        plh = int(14 * s)
         for label, val, col in ppo_rows:
-            self._blit(self.screen, self.font_xs, label, TEXT_DIM, x, y)
-            vr = self.font_xs.render(val, True, col)
+            self._blit(self.screen, self._font_xs, label, TEXT_DIM, x, y)
+            vr = self._font_xs.render(val, True, col)
             self.screen.blit(vr, (right - vr.get_width(), y))
-            y += 14
+            y += plh
 
-        y += 4
-        self._hsep(x, y, usable); y += 6
+        y += int(4 * s)
+        self._hsep(self.screen, x, y, usable); y += int(6 * s)
 
         # car info
         if car:
-            self._blit(self.screen, self.font_md, "CAR", ACCENT, x, y); y += 16
+            self._blit(self.screen, self._font_md, "CAR", ACCENT, x, y)
+            y += int(16 * s)
             car_rows = [
                 ("Checkpts", f"{car.cp_passed}"),
                 ("Laps",     f"{car.laps}"),
@@ -230,20 +336,21 @@ class GUI:
                 ("Distance", f"{car.dist:.0f}"),
             ]
             for label, val in car_rows:
-                self._blit(self.screen, self.font_xs, label, TEXT_DIM, x, y)
-                vr = self.font_xs.render(val, True, TEXT)
+                self._blit(self.screen, self._font_xs, label, TEXT_DIM, x, y)
+                vr = self._font_xs.render(val, True, TEXT)
                 self.screen.blit(vr, (right - vr.get_width(), y))
-                y += 15
-            y += 4
-            self._hsep(x, y, usable); y += 6
+                y += lh
+            y += int(4 * s)
+            self._hsep(self.screen, x, y, usable); y += int(6 * s)
 
         # learning curve
-        self._blit(self.screen, self.font_md, "LEARNING", ACCENT, x, y); y += 16
+        self._blit(self.screen, self._font_md, "LEARNING", ACCENT, x, y)
+        y += int(16 * s)
         gw = usable
-        gh = 60
+        gh = int(60 * s)
         gr = pygame.Rect(x, y, gw, gh)
-        pygame.draw.rect(self.screen, DARK_BG, gr, border_radius=3)
-        pygame.draw.rect(self.screen, SEPARATOR, gr, 1, border_radius=3)
+        pygame.draw.rect(self.screen, DARK_BG, gr, border_radius=max(1, int(3 * s)))
+        pygame.draw.rect(self.screen, SEPARATOR, gr, 1, border_radius=max(1, int(3 * s)))
 
         if len(self.hist_best) > 1:
             data = self.hist_best[-60:]
@@ -255,7 +362,7 @@ class GUI:
                 ppy = y + gh - 3 - (v / mx) * (gh - 10)
                 pts.append((ppx, ppy))
             if len(pts) >= 2:
-                pygame.draw.lines(self.screen, GOLD, False, pts, 2)
+                pygame.draw.lines(self.screen, GOLD, False, pts, max(1, int(2 * s)))
             if len(self.hist_fit) > 1:
                 data_c = self.hist_fit[-60:]
                 pts_c = []
@@ -265,87 +372,91 @@ class GUI:
                     pts_c.append((ppx, ppy))
                 if len(pts_c) >= 2:
                     pygame.draw.lines(self.screen, (70, 70, 110), False, pts_c, 1)
-            self._blit(self.screen, self.font_nn_sm, f"{mx:.0f}", TEXT_DIM, x + 2, y + 1)
+            self._blit(self.screen, self._font_nn_sm_main, f"{mx:.0f}",
+                       TEXT_DIM, x + 2, y + 1)
 
-        y += gh + 6
+        y += gh + int(6 * s)
 
         # controls
-        self._hsep(x, y, usable); y += 4
+        self._hsep(self.screen, x, y, usable); y += int(4 * s)
+        clh = int(12 * s)
         if self.test_mode:
             for t in ["SPC:Pause R:Radar", "Up/Dn:Speed N:Next", "ESC:Quit"]:
-                self._blit(self.screen, self.font_nn_sm, t, TEXT_DIM, x, y)
-                y += 12
-            y += 4
-            self._blit(self.screen, self.font_md, "TEST MODE", PPO_BLUE, x, y)
+                self._blit(self.screen, self._font_nn_sm_main, t, TEXT_DIM, x, y)
+                y += clh
+            y += int(4 * s)
+            self._blit(self.screen, self._font_md, "TEST MODE", PPO_BLUE, x, y)
         else:
             for t in ["SPC:Pause R:Radar S:Save", "Up/Dn:Speed ESC:Quit"]:
-                self._blit(self.screen, self.font_nn_sm, t, TEXT_DIM, x, y)
-                y += 12
-
-        # save flash
-        if self.save_flash > 0:
-            self.save_flash -= 1
-            alpha = min(255, self.save_flash * 4)
-            flash_s = pygame.Surface((TRACK_W, 30), pygame.SRCALPHA)
-            flash_s.fill((0, 180, 80, min(200, alpha)))
-            self.screen.blit(flash_s, (0, 0))
-            self._blit(self.screen, self.font_md, "Model saved!", (255, 255, 255), 10, 6)
+                self._blit(self.screen, self._font_nn_sm_main, t, TEXT_DIM, x, y)
+                y += clh
 
     # =====================================================================
-    #  WINDOW 2 -- Neural Network
+    #  WINDOW 2 -- Neural Network  (all coords scaled by nn_s)
     # =====================================================================
     def _draw_nn_window(self, network, activations, car, stats):
-        s = self.nn_buffer
-        s.fill(BG)
+        if not self.has_nn_window:
+            return
 
-        pad = 10
+        try:
+            pw, ph = self.nn_sdl_window.size
+        except Exception:
+            return
+        if pw < 10 or ph < 10:
+            return
 
-        # title
-        pygame.draw.rect(s, PANEL_BG, (0, 0, self.nn_w, 30))
-        pygame.draw.line(s, ACCENT, (0, 30), (self.nn_w, 30), 1)
-        self._blit(s, self.font_title, "LSTM Actor-Critic", ACCENT, pad, 5)
+        s = self._nn_s
+        buf = pygame.Surface((pw, ph))
+        buf.fill(BG)
 
-        # architecture string
+        pad = int(10 * s)
+
+        # title bar
+        bar_h = int(30 * s)
+        pygame.draw.rect(buf, PANEL_BG, (0, 0, pw, bar_h))
+        pygame.draw.line(buf, ACCENT, (0, bar_h), (pw, bar_h), 1)
+        self._blit(buf, self._nn_font_title, "LSTM Actor-Critic", ACCENT, pad, int(5 * s))
+
+        # architecture
         arch_str = network.get_architecture_str()
         total_p = network.count_params()
-        self._blit(s, self.font_nn_sm, f"{arch_str}  [{total_p:,}p]",
-                   TEXT_DIM, pad, 34)
+        self._blit(buf, self._nn_font_nn_sm, f"{arch_str}  [{total_p:,}p]",
+                   TEXT_DIM, pad, int(34 * s))
 
         # NN diagram
-        nn_y = 50
-        nn_h = 280
-        self._draw_nn_diagram(s, pad, nn_y, self.nn_w - 2 * pad, nn_h,
-                              network, activations)
+        nn_y = int(50 * s)
+        nn_h = int(280 * s)
+        self._draw_nn_diagram(buf, pad, nn_y, pw - 2 * pad, nn_h,
+                              network, activations, s)
 
         # bottom panels
-        bot_y = nn_y + nn_h + 8
-        bot_h = self.nn_h - bot_y - pad
-        half_w = (self.nn_w - 3 * pad) // 2
+        bot_y = nn_y + nn_h + int(8 * s)
+        bot_h = ph - bot_y - pad
+        half_w = (pw - 3 * pad) // 2
 
-        self._draw_io_panel(s, pad, bot_y, half_w, bot_h, activations, car)
-        self._draw_act_panel(s, pad * 2 + half_w, bot_y, half_w, bot_h,
-                             network, activations)
+        self._draw_io_panel(buf, pad, bot_y, half_w, bot_h, activations, car, s)
+        self._draw_act_panel(buf, pad * 2 + half_w, bot_y, half_w, bot_h,
+                             network, activations, s)
 
-        if self.has_nn_window:
-            tex = Texture.from_surface(self.nn_renderer, s)
-            self.nn_renderer.clear()
-            tex.draw()
-            self.nn_renderer.present()
-            del tex
+        tex = Texture.from_surface(self.nn_renderer, buf)
+        self.nn_renderer.clear()
+        tex.draw()
+        self.nn_renderer.present()
+        del tex
 
     # -- NN diagram --------------------------------------------------------
-    def _draw_nn_diagram(self, surface, x0, y0, w, h, network, activations):
+    def _draw_nn_diagram(self, surface, x0, y0, w, h, network, activations, s):
         box = pygame.Rect(x0, y0, w, h)
-        pygame.draw.rect(surface, DARK_BG, box, border_radius=6)
-        pygame.draw.rect(surface, SEPARATOR, box, 1, border_radius=6)
+        pygame.draw.rect(surface, DARK_BG, box, border_radius=max(1, int(6 * s)))
+        pygame.draw.rect(surface, SEPARATOR, box, 1, border_radius=max(1, int(6 * s)))
 
         arch = network.get_layer_sizes()
         n_layers = len(arch)
 
-        draw_x0 = x0 + 45
-        draw_x1 = x0 + w - 50
-        draw_y0 = y0 + 22
-        draw_y1 = y0 + h - 20
+        draw_x0 = x0 + int(45 * s)
+        draw_x1 = x0 + w - int(50 * s)
+        draw_y0 = y0 + int(22 * s)
+        draw_y1 = y0 + h - int(20 * s)
 
         layer_xs = [draw_x0 + i * (draw_x1 - draw_x0) / max(1, n_layers - 1)
                     for i in range(n_layers)]
@@ -360,7 +471,6 @@ class GUI:
             avail = draw_y1 - draw_y0
             spacing = avail / (show + (1 if truncated else 0))
             act = activations[li] if li < len(activations) else [0] * size
-
             if isinstance(act, (int, float)):
                 act = [act]
 
@@ -399,7 +509,8 @@ class GUI:
             is_io = li == 0 or li == n_layers - 1
             for (nx, ny, val) in positions:
                 if val == -1:
-                    self._blit_s(surface, self.font_xs, "..", TEXT_DIM, nx - 5, ny - 4)
+                    self._blit(surface, self._nn_font_xs, "..", TEXT_DIM,
+                               nx - int(5 * s), ny - int(4 * s))
                     continue
 
                 clamped = max(0.0, min(1.0, abs(val)))
@@ -407,129 +518,147 @@ class GUI:
                 g = int(40 + 210 * clamped)
                 b = int(50 + 30 * clamped)
                 color = (r, g, b)
-                rad = 6 if is_io else 4
+                rad = int(6 * s) if is_io else int(4 * s)
 
                 pygame.draw.circle(surface, color, (int(nx), int(ny)), rad)
                 if clamped > 0.5:
-                    outline_c = (min(255, int(r * 1.3)), min(255, int(g * 1.2)),
-                                 min(255, int(b * 1.2)))
-                    pygame.draw.circle(surface, outline_c, (int(nx), int(ny)), rad, 1)
+                    oc = (min(255, int(r * 1.3)), min(255, int(g * 1.2)),
+                          min(255, int(b * 1.2)))
+                    pygame.draw.circle(surface, oc, (int(nx), int(ny)), rad, 1)
                 else:
                     pygame.draw.circle(surface, SEPARATOR, (int(nx), int(ny)), rad, 1)
 
-        # layer labels at top
+        # layer labels
         layer_names = ["In", "FC1", "FC2", "LSTM", "ActFC", "Out"]
         for i in range(n_layers):
             lx = layer_xs[i]
             s_txt = str(arch[i])
-            tw = self.font_nn_sm.size(s_txt)[0]
-            self._blit_s(surface, self.font_nn_sm, s_txt, ACCENT, lx - tw // 2, y0 + 4)
+            tw = self._nn_font_nn_sm.size(s_txt)[0]
+            self._blit(surface, self._nn_font_nn_sm, s_txt, ACCENT,
+                       lx - tw // 2, y0 + int(4 * s))
 
             if i < len(layer_names):
                 lbl = layer_names[i]
-                tw2 = self.font_nn_sm.size(lbl)[0]
+                tw2 = self._nn_font_nn_sm.size(lbl)[0]
                 col = PPO_BLUE if lbl == "LSTM" else TEXT_DIM
-                self._blit_s(surface, self.font_nn_sm, lbl, col, lx - tw2 // 2, y0 + h - 15)
+                self._blit(surface, self._nn_font_nn_sm, lbl, col,
+                           lx - tw2 // 2, y0 + h - int(15 * s))
 
-        # output labels
+        # output value labels
         for idx, (nx, ny, val) in enumerate(node_positions[-1]):
             if val == -1:
                 continue
             if idx < len(OUTPUT_LABELS):
                 lbl = OUTPUT_LABELS[idx]
                 c = GOOD if abs(val) > 0.3 else NODE_OFF
-                self._blit_s(surface, self.font_nn_sm, lbl, c, nx + 10, ny - 9)
-                self._blit_s(surface, self.font_nn_sm, f"{val:+.2f}", c, nx + 10, ny + 1)
+                self._blit(surface, self._nn_font_nn_sm, lbl, c,
+                           nx + int(10 * s), ny - int(9 * s))
+                self._blit(surface, self._nn_font_nn_sm, f"{val:+.2f}", c,
+                           nx + int(10 * s), ny + int(1 * s))
 
     # -- I/O panel ---------------------------------------------------------
-    def _draw_io_panel(self, surface, x0, y0, w, h, activations, car):
+    def _draw_io_panel(self, surface, x0, y0, w, h, activations, car, s):
         box = pygame.Rect(x0, y0, w, h)
-        pygame.draw.rect(surface, DARK_BG, box, border_radius=6)
-        pygame.draw.rect(surface, SEPARATOR, box, 1, border_radius=6)
+        pygame.draw.rect(surface, DARK_BG, box, border_radius=max(1, int(6 * s)))
+        pygame.draw.rect(surface, SEPARATOR, box, 1, border_radius=max(1, int(6 * s)))
 
-        ix = x0 + 8
-        iw = w - 16
-        y = y0 + 6
+        ix = x0 + int(8 * s)
+        iw = w - int(16 * s)
+        y = y0 + int(6 * s)
 
-        self._blit_s(surface, self.font_nn, "INPUTS (15)", ACCENT, ix, y); y += 14
+        self._blit(surface, self._nn_font_nn, "INPUTS (15)", ACCENT, ix, y)
+        y += int(14 * s)
 
         if activations and len(activations) > 0:
             inputs = activations[0]
-            bar_w = iw - 70
+            label_w = int(46 * s)
+            val_w = int(24 * s)
+            bar_w = iw - label_w - val_w
             for i in range(min(15, len(inputs))):
                 val = float(inputs[i])
                 lbl = INPUT_LABELS[i] if i < len(INPUT_LABELS) else f"I{i}"
-                self._blit_s(surface, self.font_nn_sm, lbl, TEXT_DIM, ix, y)
+                self._blit(surface, self._nn_font_nn_sm, lbl, TEXT_DIM, ix, y)
 
-                bx = ix + 46
-                bh = 8
-                pygame.draw.rect(surface, (35, 35, 48), (bx, y, bar_w, bh), border_radius=2)
+                bx = ix + label_w
+                bh = max(2, int(8 * s))
+                pygame.draw.rect(surface, (35, 35, 48),
+                                 (bx, y, bar_w, bh), border_radius=max(1, int(2 * s)))
 
-                # for angle/curvature inputs (can be negative), show centered bar
                 if i >= 12:
+                    cval = _clamp(val, -1.0, 1.0)
                     mid_x = bx + bar_w // 2
-                    fw = int(abs(val) * bar_w / 2)
-                    bc = (60, 180, 230) if val >= 0 else (230, 120, 60)
-                    if val >= 0:
-                        pygame.draw.rect(surface, bc, (mid_x, y, fw, bh), border_radius=2)
-                    else:
-                        pygame.draw.rect(surface, bc, (mid_x - fw, y, fw, bh), border_radius=2)
+                    fw = int(abs(cval) * bar_w / 2)
+                    bc = (60, 180, 230) if cval >= 0 else (230, 120, 60)
+                    if fw > 0:
+                        if cval >= 0:
+                            pygame.draw.rect(surface, bc, (mid_x, y, fw, bh),
+                                             border_radius=max(1, int(2 * s)))
+                        else:
+                            pygame.draw.rect(surface, bc, (mid_x - fw, y, fw, bh),
+                                             border_radius=max(1, int(2 * s)))
                     pygame.draw.line(surface, SEPARATOR, (mid_x, y), (mid_x, y + bh), 1)
                 else:
-                    fw = max(0, int(val * bar_w))
+                    cval = _clamp(val, 0.0, 1.0)
+                    fw = max(0, int(cval * bar_w))
                     if fw > 0:
-                        bc = (int(200 - 150 * val), int(60 + 170 * val), 50)
-                        pygame.draw.rect(surface, bc, (bx, y, fw, bh), border_radius=2)
+                        bc = (int(200 - 150 * cval), int(60 + 170 * cval), 50)
+                        pygame.draw.rect(surface, bc, (bx, y, fw, bh),
+                                         border_radius=max(1, int(2 * s)))
 
-                self._blit_s(surface, self.font_nn_sm, f"{val:+.2f}", TEXT,
-                             bx + bar_w + 4, y)
-                y += 12
+                self._blit(surface, self._nn_font_nn_sm, f"{val:+.2f}", TEXT,
+                           bx + bar_w + int(4 * s), y)
+                y += int(12 * s)
 
-        y += 6
-        self._blit_s(surface, self.font_nn, "OUTPUTS (2)", ACCENT, ix, y); y += 14
+        y += int(6 * s)
+        self._blit(surface, self._nn_font_nn, "OUTPUTS (2)", ACCENT, ix, y)
+        y += int(14 * s)
 
         if activations and len(activations) > 1:
             outputs = activations[-1]
-            bar_w = iw - 80
+            label_w_o = int(55 * s)
+            val_w_o = int(25 * s)
+            bar_w = iw - label_w_o - val_w_o
             for i in range(min(2, len(outputs))):
                 val = float(outputs[i])
                 lbl = OUTPUT_LABELS[i] if i < len(OUTPUT_LABELS) else f"O{i}"
                 c = GOOD if abs(val) > 0.3 else NODE_OFF
-                self._blit_s(surface, self.font_sm, lbl, c, ix, y)
+                self._blit(surface, self._nn_font_sm, lbl, c, ix, y)
 
-                bx = ix + 55
-                bh = 14
-                pygame.draw.rect(surface, (35, 35, 48), (bx, y, bar_w, bh), border_radius=2)
+                bx = ix + label_w_o
+                bh = max(4, int(14 * s))
+                pygame.draw.rect(surface, (35, 35, 48),
+                                 (bx, y, bar_w, bh), border_radius=max(1, int(2 * s)))
 
-                # centered bar (value can be -1 to +1)
                 mid_x = bx + bar_w // 2
                 fw = int(abs(val) * bar_w / 2)
                 if val >= 0:
-                    pygame.draw.rect(surface, GOOD, (mid_x, y, fw, bh), border_radius=2)
+                    pygame.draw.rect(surface, GOOD, (mid_x, y, fw, bh),
+                                     border_radius=max(1, int(2 * s)))
                 else:
-                    pygame.draw.rect(surface, PPO_RED, (mid_x - fw, y, fw, bh), border_radius=2)
+                    pygame.draw.rect(surface, PPO_RED, (mid_x - fw, y, fw, bh),
+                                     border_radius=max(1, int(2 * s)))
 
-                # center line
                 pygame.draw.line(surface, TEXT, (mid_x, y), (mid_x, y + bh), 1)
 
-                self._blit_s(surface, self.font_nn_sm, f"{val:+.3f}", TEXT,
-                             bx + bar_w + 4, y + 2)
-                y += 22
+                self._blit(surface, self._nn_font_nn_sm, f"{val:+.3f}", TEXT,
+                           bx + bar_w + int(4 * s), y + int(2 * s))
+                y += int(22 * s)
 
     # -- Activation stats panel --------------------------------------------
-    def _draw_act_panel(self, surface, x0, y0, w, h, network, activations):
+    def _draw_act_panel(self, surface, x0, y0, w, h, network, activations, s):
         box = pygame.Rect(x0, y0, w, h)
-        pygame.draw.rect(surface, DARK_BG, box, border_radius=6)
-        pygame.draw.rect(surface, SEPARATOR, box, 1, border_radius=6)
+        pygame.draw.rect(surface, DARK_BG, box, border_radius=max(1, int(6 * s)))
+        pygame.draw.rect(surface, SEPARATOR, box, 1, border_radius=max(1, int(6 * s)))
 
-        ix = x0 + 8
-        iw = w - 16
-        y = y0 + 6
+        ix = x0 + int(8 * s)
+        iw = w - int(16 * s)
+        y = y0 + int(6 * s)
 
         arch = network.get_layer_sizes()
         layer_names = ["In", "FC1", "FC2", "LSTM", "ActFC", "Out"]
 
-        self._blit_s(surface, self.font_nn, "ACTIVATIONS", ACCENT, ix, y); y += 14
+        self._blit(surface, self._nn_font_nn, "ACTIVATIONS", ACCENT, ix, y)
+        y += int(14 * s)
 
         for li in range(len(arch)):
             if li >= len(activations):
@@ -543,12 +672,13 @@ class GUI:
 
             name = layer_names[li] if li < len(layer_names) else f"L{li}"
             col = PPO_BLUE if name == "LSTM" else ACCENT
-            self._blit_s(surface, self.font_nn_sm, f"{name}[{arch[li]}]", col, ix, y)
+            self._blit(surface, self._nn_font_nn_sm, f"{name}[{arch[li]}]",
+                       col, ix, y)
 
             # heatmap
-            hm_x = ix + 52
-            hm_w = iw - 110
-            hm_h = 9
+            hm_x = ix + int(52 * s)
+            hm_w = iw - int(110 * s)
+            hm_h = max(2, int(9 * s))
             num_cells = min(len(act_np), 24)
             cell_w = hm_w / max(1, num_cells)
             for ci in range(num_cells):
@@ -561,30 +691,29 @@ class GUI:
                 pygame.draw.rect(surface, (cr, cg, cb), (cx_pos, y + 1, cw, hm_h))
             pygame.draw.rect(surface, SEPARATOR, (hm_x, y + 1, hm_w, hm_h), 1)
 
-            self._blit_s(surface, self.font_nn_sm,
-                         f"{mean_a:.2f} {on_cnt}on",
-                         TEXT_DIM, hm_x + hm_w + 4, y + 1)
-            y += 16
+            self._blit(surface, self._nn_font_nn_sm,
+                       f"{mean_a:.2f} {on_cnt}on",
+                       TEXT_DIM, hm_x + hm_w + int(4 * s), y + 1)
+            y += int(16 * s)
 
-        y += 6
-        self._blit_s(surface, self.font_nn, "WEIGHTS", ACCENT, ix, y); y += 14
+        y += int(6 * s)
+        self._blit(surface, self._nn_font_nn, "WEIGHTS", ACCENT, ix, y)
+        y += int(14 * s)
         w_stats = network.get_weight_stats()
         for ws in w_stats:
-            self._blit_s(surface, self.font_nn_sm,
-                         f"{ws['name']} |W|={ws['mean_w']:.3f} s={ws['std_w']:.3f}",
-                         TEXT_DIM, ix, y)
-            y += 13
+            self._blit(surface, self._nn_font_nn_sm,
+                       f"{ws['name']} |W|={ws['mean_w']:.3f} s={ws['std_w']:.3f}",
+                       TEXT_DIM, ix, y)
+            y += int(13 * s)
 
     # -- helpers -----------------------------------------------------------
-    def _blit(self, surface, font, text, color, x, y):
-        surface.blit(font.render(text, True, color), (x, y))
+    @staticmethod
+    def _blit(surface, font, text, color, x, y):
+        surface.blit(font.render(text, True, color), (int(x), int(y)))
 
-    def _blit_s(self, surface, font, text, color, x, y):
-        """Blit on any surface (not just self.screen)."""
-        surface.blit(font.render(text, True, color), (x, y))
-
-    def _hsep(self, x, y, w):
-        pygame.draw.line(self.screen, SEPARATOR, (x, y), (x + w, y), 1)
+    @staticmethod
+    def _hsep(surface, x, y, w):
+        pygame.draw.line(surface, SEPARATOR, (int(x), int(y)), (int(x + w), int(y)), 1)
 
     def update_history(self, fitness, best):
         self.hist_fit.append(fitness)
