@@ -1,233 +1,399 @@
 """
-Feedforward Neural Network (pure NumPy).
-Architecture: 5 -> 64 -> 64 -> 48 -> 48 -> 32 -> 16 -> 4
-Training via Evolutionary Strategy (ES):
-  - Each episode, the car drives until it crashes.
-  - If the score improves -> keep the weights.
-  - Gaussian noise is applied for exploration.
-  - Noise decreases as the model improves.
+LSTM Actor-Critic with PPO (Proximal Policy Optimization).
+==========================================================
+- Actor:  LSTM-based policy network with continuous outputs
+          (steering: tanh, throttle: tanh)
+- Critic: LSTM-based value network (shared backbone)
+- Memory: LSTM hidden state carries temporal context across timesteps
+- Training: PPO with GAE (Generalized Advantage Estimation)
 
-Save/Load:
-  - Save trained model to JSON with architecture + weights.
-  - Load a model and test it on any circuit (no noise).
+Inputs (15):
+  12 radars + speed + angle_to_cp + curvature
+Outputs (2):
+  steering [-1, +1],  throttle [-1, +1]
 """
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import numpy as np
 import json, os
-import warnings
-warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-# -- Activation functions -------------------------------------------------
-def relu(x):
-    return np.maximum(0, x)
+DEVICE = torch.device("cpu")
 
-def sigmoid(x):
-    return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
 
-# -- Neural Network -------------------------------------------------------
-class NeuralNetwork:
-    """Dense feedforward network with 4 hidden layers."""
+# =====================================================================
+#  Actor-Critic LSTM Network
+# =====================================================================
+class ActorCriticLSTM(nn.Module):
+    """
+    Shared LSTM backbone -> Actor head (continuous) + Critic head.
+    In(15) -> FC(128) -> FC(128) -> LSTM(128) -> Actor(2) + Critic(1)
+    """
 
-    ARCHITECTURE = [5, 64, 64, 48, 48, 32, 16, 4]  # inputs -> hidden -> outputs
+    INPUT_DIM   = 15
+    HIDDEN_FC   = 128
+    LSTM_SIZE   = 128
+    LSTM_LAYERS = 1
+    ACTION_DIM  = 2   # steering, throttle
 
     def __init__(self):
-        self.layers = []
+        super().__init__()
+
+        # shared feature extractor
+        self.fc1 = nn.Linear(self.INPUT_DIM, self.HIDDEN_FC)
+        self.fc2 = nn.Linear(self.HIDDEN_FC, self.HIDDEN_FC)
+
+        # LSTM for temporal memory
+        self.lstm = nn.LSTM(
+            input_size=self.HIDDEN_FC,
+            hidden_size=self.LSTM_SIZE,
+            num_layers=self.LSTM_LAYERS,
+            batch_first=True,
+        )
+
+        # actor head: mean of actions
+        self.actor_fc = nn.Linear(self.LSTM_SIZE, 64)
+        self.actor_out = nn.Linear(64, self.ACTION_DIM)
+
+        # actor log_std (learnable)
+        self.actor_log_std = nn.Parameter(torch.zeros(self.ACTION_DIM))
+
+        # critic head: state value
+        self.critic_fc = nn.Linear(self.LSTM_SIZE, 64)
+        self.critic_out = nn.Linear(64, 1)
+
         self._init_weights()
 
-    # -- Xavier initialization ---------------------------------------------
     def _init_weights(self):
-        self.layers = []
-        arch = self.ARCHITECTURE
-        for i in range(len(arch) - 1):
-            fan_in, fan_out = arch[i], arch[i + 1]
-            std = np.sqrt(2.0 / (fan_in + fan_out))
-            W = np.random.randn(fan_in, fan_out) * std
-            b = np.zeros(fan_out)
-            self.layers.append((W, b))
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                nn.init.constant_(m.bias, 0)
+        # small init for actor output -> more exploration early
+        nn.init.orthogonal_(self.actor_out.weight, gain=0.01)
+        nn.init.constant_(self.actor_out.bias, 0)
 
-    # -- forward pass ------------------------------------------------------
-    def forward(self, inputs: list[float]) -> list[float]:
-        """Propagate inputs through the network. Returns 4 outputs."""
-        x = np.array(inputs, dtype=np.float64)
-        for i, (W, b) in enumerate(self.layers):
-            x = x @ W + b
-            if i < len(self.layers) - 1:
-                x = relu(x)
-            else:
-                x = sigmoid(x)
-        return x.tolist()
+    def init_hidden(self, batch_size=1):
+        """Create fresh LSTM hidden state."""
+        h = torch.zeros(self.LSTM_LAYERS, batch_size, self.LSTM_SIZE, device=DEVICE)
+        c = torch.zeros(self.LSTM_LAYERS, batch_size, self.LSTM_SIZE, device=DEVICE)
+        return (h, c)
 
-    # -- flat parameter access ---------------------------------------------
-    def get_params(self) -> np.ndarray:
-        """Get all weights and biases as a 1-D vector."""
-        parts = []
-        for W, b in self.layers:
-            parts.append(W.ravel())
-            parts.append(b.ravel())
-        return np.concatenate(parts)
+    def forward(self, x, hidden):
+        """
+        x:      (batch, seq_len, INPUT_DIM) or (INPUT_DIM,)
+        hidden: (h, c) LSTM state
+        Returns: action_mean, action_std, value, new_hidden
+        """
+        if x.dim() == 1:
+            x = x.unsqueeze(0).unsqueeze(0)
+        elif x.dim() == 2:
+            x = x.unsqueeze(1)
 
-    def set_params(self, flat: np.ndarray):
-        """Load weights from a 1-D vector."""
-        idx = 0
-        new_layers = []
-        arch = self.ARCHITECTURE
-        for i in range(len(arch) - 1):
-            fan_in, fan_out = arch[i], arch[i + 1]
-            w_size = fan_in * fan_out
-            W = flat[idx:idx + w_size].reshape(fan_in, fan_out)
-            idx += w_size
-            b = flat[idx:idx + fan_out].copy()
-            idx += fan_out
-            new_layers.append((W, b))
-        self.layers = new_layers
+        # shared trunk
+        z = torch.relu(self.fc1(x))
+        z = torch.relu(self.fc2(z))
 
-    def count_params(self) -> int:
-        return sum(W.size + b.size for W, b in self.layers)
+        lstm_out, new_hidden = self.lstm(z, hidden)
+        last = lstm_out[:, -1, :]          # (batch, LSTM_SIZE)
 
-    def copy(self) -> "NeuralNetwork":
-        nn = NeuralNetwork.__new__(NeuralNetwork)
-        nn.layers = [(W.copy(), b.copy()) for W, b in self.layers]
-        return nn
+        # actor
+        a = torch.relu(self.actor_fc(last))
+        action_mean = torch.tanh(self.actor_out(a))
+        action_std  = torch.exp(torch.clamp(self.actor_log_std, -5, 2)).expand_as(action_mean)
 
-    # -- layer info (for visualization) ------------------------------------
-    def get_layer_activations(self, inputs: list[float]):
-        """Return activations of EACH layer (for visualization)."""
-        activations = [np.array(inputs)]
-        x = np.array(inputs, dtype=np.float64)
-        for i, (W, b) in enumerate(self.layers):
-            x = x @ W + b
-            if i < len(self.layers) - 1:
-                x = relu(x)
-            else:
-                x = sigmoid(x)
-            activations.append(x.copy())
+        # critic
+        v = torch.relu(self.critic_fc(last))
+        value = self.critic_out(v)
+
+        return action_mean, action_std, value, new_hidden
+
+    # -- inference helpers ------------------------------------------------
+    @torch.no_grad()
+    def act(self, obs, hidden):
+        """Select action for a single observation.
+        Returns (action_np, log_prob, value, new_hidden)."""
+        obs_t = torch.FloatTensor(obs).to(DEVICE)
+        mean, std, value, new_hidden = self.forward(obs_t, hidden)
+
+        dist = torch.distributions.Normal(mean, std)
+        action = dist.sample()
+        action = torch.clamp(action, -1.0, 1.0)
+        log_prob = dist.log_prob(action).sum(dim=-1)
+
+        return (
+            action.squeeze(0).cpu().numpy(),
+            log_prob.item(),
+            value.item(),
+            new_hidden,
+        )
+
+    @torch.no_grad()
+    def act_deterministic(self, obs, hidden):
+        """Deterministic action (for test mode)."""
+        obs_t = torch.FloatTensor(obs).to(DEVICE)
+        mean, _, value, new_hidden = self.forward(obs_t, hidden)
+        action = torch.clamp(mean, -1.0, 1.0)
+        return action.squeeze(0).cpu().numpy(), value.item(), new_hidden
+
+    @torch.no_grad()
+    def get_value(self, obs, hidden):
+        obs_t = torch.FloatTensor(obs).to(DEVICE)
+        _, _, value, _ = self.forward(obs_t, hidden)
+        return value.item()
+
+    def evaluate_actions(self, obs_batch, actions_batch, hidden):
+        """Evaluate a batch for PPO update."""
+        mean, std, values, _ = self.forward(obs_batch, hidden)
+        dist = torch.distributions.Normal(mean, std)
+        log_probs = dist.log_prob(actions_batch).sum(dim=-1)
+        entropy = dist.entropy().sum(dim=-1)
+        return log_probs, values.squeeze(-1), entropy
+
+    def count_params(self):
+        return sum(p.numel() for p in self.parameters())
+
+    def get_architecture_str(self):
+        return (
+            f"In({self.INPUT_DIM}) > FC({self.HIDDEN_FC})x2 "
+            f"> LSTM({self.LSTM_SIZE}) > Actor({self.ACTION_DIM}) + Critic(1)"
+        )
+
+    # -- visualization helpers -------------------------------------------
+    def get_layer_sizes(self):
+        return [self.INPUT_DIM, self.HIDDEN_FC, self.HIDDEN_FC,
+                self.LSTM_SIZE, 64, self.ACTION_DIM]
+
+    @torch.no_grad()
+    def get_activations(self, obs, hidden):
+        """Return per-layer activations for GUI visualization."""
+        obs_np = np.array(obs, dtype=np.float32)
+        obs_t = torch.FloatTensor(obs_np).unsqueeze(0).unsqueeze(0).to(DEVICE)
+
+        activations = [obs_np.tolist()]
+
+        z1 = torch.relu(self.fc1(obs_t))
+        activations.append(z1.squeeze().cpu().numpy().tolist())
+
+        z2 = torch.relu(self.fc2(z1))
+        activations.append(z2.squeeze().cpu().numpy().tolist())
+
+        lstm_out, _ = self.lstm(z2, hidden)
+        last = lstm_out[:, -1, :]
+        activations.append(last.squeeze().cpu().numpy().tolist())
+
+        a = torch.relu(self.actor_fc(last))
+        activations.append(a.squeeze().cpu().numpy().tolist())
+
+        out = torch.tanh(self.actor_out(a))
+        activations.append(out.squeeze().cpu().numpy().tolist())
+
         return activations
 
+    @torch.no_grad()
     def get_weight_stats(self):
-        """Return per-layer weight statistics for visualization."""
+        """Per-layer weight statistics for visualization."""
+        layers = [self.fc1, self.fc2, self.lstm, self.actor_fc, self.actor_out]
+        names  = ["FC1", "FC2", "LSTM", "ActorFC", "ActorOut"]
         stats = []
-        for i, (W, b) in enumerate(self.layers):
+        for name, layer in zip(names, layers):
+            params = list(layer.parameters())
+            all_w = torch.cat([p.detach().flatten() for p in params])
             stats.append({
-                "mean_w": float(np.mean(np.abs(W))),
-                "max_w": float(np.max(np.abs(W))),
-                "mean_b": float(np.mean(np.abs(b))),
-                "std_w": float(np.std(W)),
+                "name": name,
+                "mean_w": float(torch.mean(torch.abs(all_w))),
+                "std_w": float(torch.std(all_w)),
+                "max_w": float(torch.max(torch.abs(all_w))),
             })
         return stats
 
 
-# -- Evolutionary Strategy ------------------------------------------------
-class EvolutionaryTrainer:
-    """
-    Train a neural network via Evolutionary Strategy (ES).
-    - Keep the best weights found.
-    - Explore by adding Gaussian noise.
-    - Reduce noise when the score improves (annealing).
-    """
+# =====================================================================
+#  Trajectory Buffer (PPO rollout storage)
+# =====================================================================
+class TrajectoryBuffer:
+    def __init__(self):
+        self.clear()
 
-    def __init__(self, network: NeuralNetwork):
+    def clear(self):
+        self.observations = []
+        self.actions      = []
+        self.log_probs    = []
+        self.rewards      = []
+        self.values       = []
+        self.dones        = []
+
+    def push(self, obs, action, log_prob, reward, value, done):
+        self.observations.append(np.array(obs, dtype=np.float32))
+        self.actions.append(np.array(action, dtype=np.float32))
+        self.log_probs.append(log_prob)
+        self.rewards.append(reward)
+        self.values.append(value)
+        self.dones.append(float(done))
+
+    def __len__(self):
+        return len(self.rewards)
+
+    def compute_gae(self, last_value, gamma=0.99, lam=0.95):
+        """Generalized Advantage Estimation."""
+        n = len(self.rewards)
+        advantages = np.zeros(n, dtype=np.float32)
+        gae = 0.0
+        for t in reversed(range(n)):
+            if t == n - 1:
+                next_val = last_value
+            else:
+                next_val = self.values[t + 1]
+            next_non_done = 1.0 - self.dones[t]
+            delta = self.rewards[t] + gamma * next_val * next_non_done - self.values[t]
+            gae = delta + gamma * lam * next_non_done * gae
+            advantages[t] = gae
+        returns = advantages + np.array(self.values, dtype=np.float32)
+        return returns, advantages
+
+
+# =====================================================================
+#  PPO Trainer
+# =====================================================================
+class PPOTrainer:
+    """Proximal Policy Optimization trainer."""
+
+    def __init__(self, network: ActorCriticLSTM):
         self.network = network
-        self.best_params = network.get_params().copy()
-        self.best_fitness = -1e9
-        self.current_fitness = 0
+        self.optimizer = optim.Adam(network.parameters(), lr=3e-4, eps=1e-5)
 
-        # Hyperparameters
-        self.noise_std = 0.8
-        self.noise_min = 0.005
-        self.noise_decay = 0.999
-        self.noise_boost = 1.5
-        self.stagnation = 0
-        self.stagnation_limit = 40
+        # PPO hyperparameters
+        self.clip_eps       = 0.2
+        self.gamma          = 0.99
+        self.gae_lambda     = 0.95
+        self.entropy_coef   = 0.01
+        self.value_coef     = 0.5
+        self.max_grad_norm  = 0.5
+        self.ppo_epochs     = 4
+        self.mini_batch_size = 64
 
-        # Statistics
-        self.episode = 0
-        self.improvements = 0
-        self.history_fitness = []
-        self.history_best = []
-        self.learning_rate_history = []
+        # stats
+        self.episode        = 0
+        self.total_updates  = 0
+        self.best_fitness   = -1e9
+        self.improvements   = 0
+        self.last_pg_loss   = 0.0
+        self.last_v_loss    = 0.0
+        self.last_entropy   = 0.0
+        self.recent_rewards = []
 
-    def start_episode(self):
-        """Prepare a new episode: apply noise to best weights."""
-        self.episode += 1
-        noise = np.random.randn(len(self.best_params)) * self.noise_std
-        candidate = self.best_params + noise
-        self.network.set_params(candidate)
-        self.current_fitness = 0
+        # buffer
+        self.buffer = TrajectoryBuffer()
 
-    def end_episode(self, fitness: float):
-        """End of episode: keep if better, otherwise roll back."""
-        self.current_fitness = fitness
-        self.history_fitness.append(fitness)
+    def update(self, last_value):
+        """Run PPO update on the collected buffer."""
+        if len(self.buffer) < self.mini_batch_size:
+            self.buffer.clear()
+            return
 
-        if fitness > self.best_fitness:
-            self.best_fitness = fitness
-            self.best_params = self.network.get_params().copy()
-            self.improvements += 1
-            improved = True
-            self.stagnation = 0
-            self.noise_std = min(0.6, self.noise_std * self.noise_boost)
-        else:
-            self.network.set_params(self.best_params.copy())
-            improved = False
-            self.stagnation += 1
+        returns, advantages = self.buffer.compute_gae(
+            last_value, self.gamma, self.gae_lambda
+        )
 
-        # Anti-stagnation
-        if self.stagnation >= self.stagnation_limit:
-            self.noise_std = min(1.0, self.noise_std * 3.0)
-            self.stagnation = 0
+        obs_t     = torch.FloatTensor(np.array(self.buffer.observations)).to(DEVICE)
+        act_t     = torch.FloatTensor(np.array(self.buffer.actions)).to(DEVICE)
+        old_log_t = torch.FloatTensor(np.array(self.buffer.log_probs)).to(DEVICE)
+        ret_t     = torch.FloatTensor(returns).to(DEVICE)
+        adv_t     = torch.FloatTensor(advantages).to(DEVICE)
+        adv_t     = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
 
-        self.history_best.append(self.best_fitness)
-        self.learning_rate_history.append(self.noise_std)
+        n = len(self.buffer)
+        total_pg = total_v = total_ent = 0.0
+        num_updates = 0
 
-        self.noise_std = max(self.noise_min, self.noise_std * self.noise_decay)
+        for _ in range(self.ppo_epochs):
+            perm = np.random.permutation(n)
+            for start in range(0, n, self.mini_batch_size):
+                end = min(start + self.mini_batch_size, n)
+                idx = perm[start:end]
 
-        return improved
+                mb_obs = obs_t[idx]
+                mb_act = act_t[idx]
+                mb_old_log = old_log_t[idx]
+                mb_ret = ret_t[idx]
+                mb_adv = adv_t[idx]
+
+                hidden = self.network.init_hidden(len(idx))
+                new_log, values, entropy = self.network.evaluate_actions(
+                    mb_obs, mb_act, hidden
+                )
+
+                ratio = torch.exp(new_log - mb_old_log)
+                surr1 = ratio * mb_adv
+                surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * mb_adv
+                pg_loss = -torch.min(surr1, surr2).mean()
+
+                v_loss = 0.5 * (mb_ret - values).pow(2).mean()
+                ent_loss = -entropy.mean()
+
+                loss = pg_loss + self.value_coef * v_loss + self.entropy_coef * ent_loss
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.network.parameters(), self.max_grad_norm)
+                self.optimizer.step()
+
+                total_pg  += pg_loss.item()
+                total_v   += v_loss.item()
+                total_ent += entropy.mean().item()
+                num_updates += 1
+
+        self.total_updates += num_updates
+        self.last_pg_loss  = total_pg / max(1, num_updates)
+        self.last_v_loss   = total_v / max(1, num_updates)
+        self.last_entropy  = total_ent / max(1, num_updates)
+        self.buffer.clear()
 
     def get_stats(self) -> dict:
+        avg_r = float(np.mean(self.recent_rewards[-30:])) if self.recent_rewards else 0
         return {
             "episode": self.episode,
             "best_fitness": self.best_fitness,
-            "current_fitness": self.current_fitness,
-            "noise": self.noise_std,
+            "current_fitness": 0,
             "improvements": self.improvements,
             "params_count": self.network.count_params(),
+            "total_updates": self.total_updates,
+            "avg_reward": avg_r,
+            "pg_loss": self.last_pg_loss,
+            "v_loss": self.last_v_loss,
+            "entropy": self.last_entropy,
+            "lr": self.optimizer.param_groups[0]["lr"],
         }
 
     # -- Save / Load -------------------------------------------------------
     def save(self, filepath: str):
-        """Save the best model to a JSON file."""
+        os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
         data = {
-            "architecture": NeuralNetwork.ARCHITECTURE,
-            "params": self.best_params.tolist(),
+            "model_state": {k: v.tolist() for k, v in self.network.state_dict().items()},
             "best_fitness": float(self.best_fitness),
             "episode": self.episode,
             "improvements": self.improvements,
-            "noise_std": float(self.noise_std),
+            "total_updates": self.total_updates,
+            "input_dim": ActorCriticLSTM.INPUT_DIM,
+            "action_dim": ActorCriticLSTM.ACTION_DIM,
+            "lstm_size": ActorCriticLSTM.LSTM_SIZE,
         }
-        os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
         with open(filepath, "w") as f:
             json.dump(data, f)
         return filepath
 
     @staticmethod
-    def load(filepath: str) -> tuple:
-        """Load a saved model. Returns a NeuralNetwork with the saved weights."""
+    def load(filepath: str):
         with open(filepath, "r") as f:
             data = json.load(f)
-
-        saved_arch = data["architecture"]
-        if saved_arch != NeuralNetwork.ARCHITECTURE:
-            raise ValueError(
-                f"Architecture mismatch: saved={saved_arch}, "
-                f"current={NeuralNetwork.ARCHITECTURE}"
-            )
-
-        nn = NeuralNetwork()
-        params = np.array(data["params"], dtype=np.float64)
-        nn.set_params(params)
-
+        network = ActorCriticLSTM()
+        state_dict = {k: torch.tensor(v) for k, v in data["model_state"].items()}
+        network.load_state_dict(state_dict)
+        network.eval()
         info = {
             "best_fitness": data.get("best_fitness", 0),
             "episode": data.get("episode", 0),
             "improvements": data.get("improvements", 0),
+            "total_updates": data.get("total_updates", 0),
         }
-        return nn, info
+        return network, info
