@@ -45,9 +45,11 @@ NN_WIN_W, NN_WIN_H = 560, 620
 class GUI:
     """Compact dual-window GUI."""
 
-    def __init__(self):
+    def __init__(self, test_mode=False):
         pygame.init()
-        pygame.display.set_caption("CarAI -- Track")
+        self.test_mode = test_mode
+        title = "CarAI -- Test" if test_mode else "CarAI -- Track"
+        pygame.display.set_caption(title)
         self.screen = pygame.display.set_mode((WIN1_W, WIN1_H))
         self.clock = pygame.time.Clock()
 
@@ -68,6 +70,8 @@ class GUI:
         self.show_radars = True
         self.paused = False
         self.speed = 1
+        self.save_requested = False
+        self.save_flash = 0
 
         self.hist_fit  = []
         self.hist_best = []
@@ -96,6 +100,9 @@ class GUI:
                 if ev.key == pygame.K_SPACE:   self.paused = not self.paused
                 if ev.key == pygame.K_UP:      self.speed = min(20, self.speed + 1)
                 if ev.key == pygame.K_DOWN:    self.speed = max(1, self.speed - 1)
+                if ev.key == pygame.K_s and not self.test_mode:
+                    self.save_requested = True
+                    self.save_flash = 90
         return True
 
     # -- main draw ---------------------------------------------------------
@@ -236,9 +243,25 @@ class GUI:
 
         # -- controls
         self._hsep(x, y, usable); y += 4
-        for t in ["SPC:Pause R:Radar", "Up/Dn:Speed ESC:Quit"]:
-            self._blit(self.screen, self.font_nn_sm, t, TEXT_DIM, x, y)
-            y += 12
+        if self.test_mode:
+            for t in ["SPC:Pause R:Radar", "Up/Dn:Speed N:Next", "ESC:Quit"]:
+                self._blit(self.screen, self.font_nn_sm, t, TEXT_DIM, x, y)
+                y += 12
+            y += 4
+            self._blit(self.screen, self.font_md, "TEST MODE", (0, 200, 255), x, y)
+        else:
+            for t in ["SPC:Pause R:Radar S:Save", "Up/Dn:Speed ESC:Quit"]:
+                self._blit(self.screen, self.font_nn_sm, t, TEXT_DIM, x, y)
+                y += 12
+
+        # save flash
+        if self.save_flash > 0:
+            self.save_flash -= 1
+            alpha = min(255, self.save_flash * 4)
+            flash_s = pygame.Surface((TRACK_W, 30), pygame.SRCALPHA)
+            flash_s.fill((0, 180, 80, min(200, alpha)))
+            self.screen.blit(flash_s, (0, 0))
+            self._blit(self.screen, self.font_md, "Model saved!", (255, 255, 255), 10, 6)
 
     # =====================================================================
     #  WINDOW 2 -- Neural Network

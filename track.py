@@ -1,6 +1,7 @@
 """
-Track module -- Beautifully rendered circuits with 5 levels.
-Textured asphalt, red/white kerbs, ground markings, gradient grass.
+Track module -- Beautifully rendered circuits.
+Training: 5 difficulty levels.
+Testing: 3 additional unseen circuits for evaluating trained models.
 """
 import math
 import pygame
@@ -52,6 +53,12 @@ LEVEL_NAMES = [
     "Lv5  Infernal Circuit",
 ]
 
+TEST_TRACK_NAMES = [
+    "Test A  Figure Eight",
+    "Test B  Riverside",
+    "Test C  Maze Circuit",
+]
+
 def _level_data(level, cx, cy):
     """Return (control_points, track_width) for each level.
     Points are designed for a ~900x620 area (center ~450,310)."""
@@ -99,16 +106,64 @@ def _level_data(level, cx, cy):
     ], 35
 
 
+def _test_track_data(track_id, cx, cy):
+    """Return (control_points, track_width) for test circuits.
+    These are completely different shapes never seen during training."""
+    if track_id == 1:
+        # Figure-eight with crossing zone
+        return [
+            (cx - 60, cy - 250), (cx + 160, cy - 240), (cx + 320, cy - 160),
+            (cx + 370, cy - 40), (cx + 290, cy + 60), (cx + 120, cy + 40),
+            (cx - 20, cy - 40), (cx - 160, cy + 50), (cx - 310, cy + 70),
+            (cx - 380, cy - 10), (cx - 340, cy - 120), (cx - 220, cy - 200),
+            (cx - 100, cy - 240), (cx + 40, cy - 200), (cx + 130, cy - 80),
+            (cx + 50, cy + 30), (cx - 70, cy + 130), (cx - 210, cy + 200),
+            (cx - 340, cy + 230), (cx - 380, cy + 150), (cx - 300, cy + 50),
+            (cx - 160, cy - 50), (cx - 30, cy - 150), (cx - 120, cy - 210),
+        ], 44
+    if track_id == 2:
+        # Riverside: long sweeping curves with tight hairpin
+        return [
+            (cx - 350, cy - 60), (cx - 280, cy - 200), (cx - 120, cy - 255),
+            (cx + 60, cy - 240), (cx + 200, cy - 200), (cx + 310, cy - 110),
+            (cx + 380, cy + 10), (cx + 360, cy + 120), (cx + 260, cy + 180),
+            (cx + 120, cy + 150), (cx + 60, cy + 80), (cx + 100, cy + 20),
+            (cx + 180, cy + 60), (cx + 200, cy + 160), (cx + 100, cy + 240),
+            (cx - 60, cy + 260), (cx - 200, cy + 220), (cx - 320, cy + 140),
+            (cx - 380, cy + 40),
+        ], 42
+    # track_id 3: Maze-like with many direction changes
+    return [
+        (cx - 320, cy - 220), (cx - 140, cy - 250), (cx + 60, cy - 210),
+        (cx + 180, cy - 130), (cx + 120, cy - 30), (cx + 220, cy + 40),
+        (cx + 360, cy - 20), (cx + 380, cy + 100), (cx + 300, cy + 180),
+        (cx + 160, cy + 140), (cx + 60, cy + 210), (cx + 140, cy + 270),
+        (cx, cy + 260), (cx - 140, cy + 210), (cx - 80, cy + 120),
+        (cx - 200, cy + 60), (cx - 340, cy + 120), (cx - 380, cy + 20),
+        (cx - 340, cy - 100), (cx - 220, cy - 160),
+    ], 38
+
+
 # -- Track class -----------------------------------------------------------
 class Track:
-    def __init__(self, width=900, height=620, level=1):
+    def __init__(self, width=900, height=620, level=1, test_track=0):
         self.width = width
         self.height = height
-        self.level = max(1, min(5, level))
-        self.level_name = LEVEL_NAMES[self.level - 1]
+        self.is_test = test_track > 0
+        self.test_id = test_track
+
+        if self.is_test:
+            self.level = 0
+            self.level_name = TEST_TRACK_NAMES[min(test_track, len(TEST_TRACK_NAMES)) - 1]
+        else:
+            self.level = max(1, min(5, level))
+            self.level_name = LEVEL_NAMES[self.level - 1]
 
         cx, cy = width // 2, height // 2
-        pts, self.track_width = _level_data(self.level, cx, cy)
+        if self.is_test:
+            pts, self.track_width = _test_track_data(test_track, cx, cy)
+        else:
+            pts, self.track_width = _level_data(self.level, cx, cy)
         self.control_points = pts
 
         self.center = catmull_rom(pts, density=28)

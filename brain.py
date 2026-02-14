@@ -1,11 +1,15 @@
 """
 Feedforward Neural Network (pure NumPy).
-Architecture: 5 -> 64 -> 48 -> 32 -> 16 -> 4
+Architecture: 5 -> 64 -> 64 -> 48 -> 48 -> 32 -> 16 -> 4
 Training via Evolutionary Strategy (ES):
   - Each episode, the car drives until it crashes.
   - If the score improves -> keep the weights.
   - Gaussian noise is applied for exploration.
   - Noise decreases as the model improves.
+
+Save/Load:
+  - Save trained model to JSON with architecture + weights.
+  - Load a model and test it on any circuit (no noise).
 """
 import numpy as np
 import json, os
@@ -187,3 +191,43 @@ class EvolutionaryTrainer:
             "improvements": self.improvements,
             "params_count": self.network.count_params(),
         }
+
+    # -- Save / Load -------------------------------------------------------
+    def save(self, filepath: str):
+        """Save the best model to a JSON file."""
+        data = {
+            "architecture": NeuralNetwork.ARCHITECTURE,
+            "params": self.best_params.tolist(),
+            "best_fitness": float(self.best_fitness),
+            "episode": self.episode,
+            "improvements": self.improvements,
+            "noise_std": float(self.noise_std),
+        }
+        os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
+        with open(filepath, "w") as f:
+            json.dump(data, f)
+        return filepath
+
+    @staticmethod
+    def load(filepath: str) -> tuple:
+        """Load a saved model. Returns a NeuralNetwork with the saved weights."""
+        with open(filepath, "r") as f:
+            data = json.load(f)
+
+        saved_arch = data["architecture"]
+        if saved_arch != NeuralNetwork.ARCHITECTURE:
+            raise ValueError(
+                f"Architecture mismatch: saved={saved_arch}, "
+                f"current={NeuralNetwork.ARCHITECTURE}"
+            )
+
+        nn = NeuralNetwork()
+        params = np.array(data["params"], dtype=np.float64)
+        nn.set_params(params)
+
+        info = {
+            "best_fitness": data.get("best_fitness", 0),
+            "episode": data.get("episode", 0),
+            "improvements": data.get("improvements", 0),
+        }
+        return nn, info
