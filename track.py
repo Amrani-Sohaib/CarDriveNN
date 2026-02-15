@@ -1,13 +1,20 @@
 """
-Track module -- Robust procedural circuit generation.
+Track module -- Robust procedural circuit generation (v3).
+==========================================================
 Training: 5 difficulty levels.
-Testing: 3 additional unseen circuits for evaluating trained models.
+Testing:  3 additional unseen circuits.
 
-Border generation uses:
-  - Half-width offset (center ± hw) instead of full-width
-  - Smoothed normals via local derivative window
-  - Curvature-adaptive width clamping to prevent auto-intersections
-  - Minimum radius check: hw is reduced when curvature > 1/hw
+Geometry pipeline:
+  1. Catmull-Rom spline with analytic first derivative → tangent + normal
+  2. Half-width offset:  center ± normal * (track_width / 2)
+  3. Curvature-adaptive clamping:  hw = min(hw, 0.85 / κ)
+  4. Angle-clamping between consecutive normals (max 8°)
+  5. Laplacian smoothing on the adaptive half-widths (5 passes)
+  6. Bow-tie / quad-inversion detection + fix
+  7. Mask built from final road polygon only (no decorations)
+
+Debug mode (D key):
+  Displays centerline, normals, inner/outer borders, problem zones.
 """
 import math
 import pygame
@@ -28,12 +35,19 @@ FINISH_W    = (255, 255, 255)
 FINISH_B    = (30, 30, 30)
 CHECKPOINT_CLR = (255, 255, 0)
 
+# Debug palette
+DBG_CENTER  = (255, 255, 0)
+DBG_INNER   = (0, 255, 100)
+DBG_OUTER   = (255, 100, 0)
+DBG_NORMAL  = (100, 100, 255)
+DBG_PROBLEM = (255, 0, 0)
 
-# --------------------------------------------------------------------------
-#  Catmull-Rom spline with derivative output
-# --------------------------------------------------------------------------
-def catmull_rom(points, density=25):
-    """Cyclic Catmull-Rom spline.  Returns list of (x, y) points."""
+
+# ==========================================================================
+#  Catmull-Rom spline with analytic derivative
+# ==========================================================================
+def catmull_rom(points, density=30):
+    """Cyclic Catmull-Rom spline → list of (x, y)."""
     result = []
     n = len(points)
     for i in range(n):
@@ -52,39 +66,35 @@ def catmull_rom(points, density=25):
     return result
 
 
-# --------------------------------------------------------------------------
-#  Geometry helpers
-# --------------------------------------------------------------------------
-def _smooth_normals(center, window=3):
-    """Compute smoothed unit normals for a closed polyline.
-
-    Uses a symmetric window of *window* points on each side to compute
-    the local tangent, then rotates 90° CCW to get the left-pointing normal.
-    """
-    n = len(center)
-    normals = []
+def catmull_rom_derivative(points, density=30):
+    """Cyclic Catmull-Rom analytic first derivative → tangent (dx, dy)."""
+    result = []
+    n = len(points)
     for i in range(n):
-        dx, dy = 0.0, 0.0
-        for k in range(1, window + 1):
-            pp = center[(i - k) % n]
-            pn = center[(i + k) % n]
-            dx += pn[0] - pp[0]
-            dy += pn[1] - pp[1]
-        L = math.hypot(dx, dy) or 1.0
-        # normal = 90° CCW from tangent
-        normals.append((-dy / L, dx / L))
-    return normals
+        p0, p1 = points[(i - 1) % n], points[i]
+        p2, p3 = points[(i + 1) % n], points[(i + 2) % n]
+        for s in range(density):
+            t = s / density
+            t2 = t * t
+            dx = 0.5 * ((-p0[0] + p2[0]) +
+                         2 * (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t +
+                         3 * (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t2)
+            dy = 0.5 * ((-p0[1] + p2[1]) +
+                         2 * (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t +
+                         3 * (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t2)
+            result.append((dx, dy))
+    return result
 
 
+# ==========================================================================
+#  Geometry helpers
+# ==========================================================================
 def _curvature_at(center, i):
-    """Approximate curvature at point *i* using the circumscribed circle
-    through i-1, i, i+1.  Returns 1/R (higher = tighter turn)."""
+    """Menger curvature 1/R through three consecutive points."""
     n = len(center)
     ax, ay = center[(i - 1) % n]
     bx, by = center[i]
     cx, cy = center[(i + 1) % n]
-
-    # signed area of triangle * 2
     area2 = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay)
     a = math.hypot(bx - ax, by - ay)
     b = math.hypot(cx - bx, cy - by)
@@ -92,27 +102,44 @@ def _curvature_at(center, i):
     denom = a * b * c
     if denom < 1e-9:
         return 0.0
-    return abs(area2) / denom * 2.0   # = 1/R
+    return abs(area2) / denom * 2.0
+
+
+def _cross2d(ox, oy, ax, ay, bx, by):
+    """2D cross product of OA × OB."""
+    return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox)
 
 
 def _segments_intersect(p1, p2, p3, p4):
-    """Check if segment p1-p2 intersects segment p3-p4."""
-    def _cross(o, a, b):
-        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
-
-    d1 = _cross(p3, p4, p1)
-    d2 = _cross(p3, p4, p2)
-    d3 = _cross(p1, p2, p3)
-    d4 = _cross(p1, p2, p4)
-
+    """Proper intersection test between segment p1-p2 and p3-p4."""
+    d1 = _cross2d(p3[0], p3[1], p4[0], p4[1], p1[0], p1[1])
+    d2 = _cross2d(p3[0], p3[1], p4[0], p4[1], p2[0], p2[1])
+    d3 = _cross2d(p1[0], p1[1], p2[0], p2[1], p3[0], p3[1])
+    d4 = _cross2d(p1[0], p1[1], p2[0], p2[1], p4[0], p4[1])
     if ((d1 > 0 and d2 < 0) or (d1 < 0 and d2 > 0)) and \
        ((d3 > 0 and d4 < 0) or (d3 < 0 and d4 > 0)):
         return True
     return False
 
 
-# -- Level definitions -----------------------------------------------------
+def _quad_is_bowtie(p0, p1, p2, p3):
+    """Check if quad (p0, p1, p2, p3) is a bow-tie (self-intersecting).
+    A well-formed quad has diagonals that DO intersect; a bow-tie has
+    opposite edges that intersect."""
+    return _segments_intersect(p0, p1, p3, p2) or \
+           _segments_intersect(p0, p3, p1, p2)
 
+
+def _angle_between_normals(n1, n2):
+    """Unsigned angle in radians between two unit normals."""
+    dot = n1[0] * n2[0] + n1[1] * n2[1]
+    dot = max(-1.0, min(1.0, dot))
+    return math.acos(dot)
+
+
+# ==========================================================================
+#  Level definitions
+# ==========================================================================
 LEVEL_NAMES = [
     "Lv1  Discovery Oval",
     "Lv2  S-Curve",
@@ -130,10 +157,8 @@ TEST_TRACK_NAMES = [
 
 def _level_data(level, cx, cy):
     """Return (control_points, track_width) for each level.
-    track_width is the FULL road width (half-width = track_width / 2).
-    Points are designed for a ~900x620 area (center ~450, 310)."""
+    track_width = FULL road width  (half-width = track_width / 2)."""
     if level == 1:
-        # Wide oval -- very easy
         return [
             (cx, cy - 200), (cx + 155, cy - 185), (cx + 265, cy - 100),
             (cx + 280, cy + 15), (cx + 250, cy + 125), (cx + 115, cy + 195),
@@ -142,7 +167,6 @@ def _level_data(level, cx, cy):
         ], 100
 
     if level == 2:
-        # S-Curve
         return [
             (cx, cy - 220), (cx + 165, cy - 200), (cx + 290, cy - 120),
             (cx + 310, cy + 5), (cx + 280, cy + 100), (cx + 175, cy + 165),
@@ -152,7 +176,6 @@ def _level_data(level, cx, cy):
         ], 90
 
     if level == 3:
-        # Chicane -- wider curves than before to avoid crossing
         return [
             (cx - 45, cy - 240), (cx + 160, cy - 220), (cx + 310, cy - 140),
             (cx + 340, cy - 10), (cx + 280, cy + 90),
@@ -164,7 +187,6 @@ def _level_data(level, cx, cy):
         ], 80
 
     if level == 4:
-        # Hairpin -- generous spacing between switchbacks
         return [
             (cx - 20, cy - 260), (cx + 180, cy - 245), (cx + 340, cy - 150),
             (cx + 365, cy - 20), (cx + 290, cy + 80),
@@ -177,7 +199,7 @@ def _level_data(level, cx, cy):
             (cx - 280, cy - 245),
         ], 70
 
-    # level 5 -- Infernal, but with enough spacing
+    # level 5
     return [
         (cx + 10, cy - 265), (cx + 170, cy - 250), (cx + 330, cy - 190),
         (cx + 395, cy - 60), (cx + 360, cy + 50), (cx + 230, cy + 15),
@@ -192,7 +214,6 @@ def _level_data(level, cx, cy):
 def _test_track_data(track_id, cx, cy):
     """Return (control_points, track_width) for test circuits."""
     if track_id == 1:
-        # Figure-eight
         return [
             (cx - 60, cy - 250), (cx + 160, cy - 240), (cx + 320, cy - 160),
             (cx + 370, cy - 40), (cx + 290, cy + 60), (cx + 120, cy + 40),
@@ -205,7 +226,6 @@ def _test_track_data(track_id, cx, cy):
         ], 72
 
     if track_id == 2:
-        # Riverside
         return [
             (cx - 350, cy - 60), (cx - 280, cy - 200), (cx - 120, cy - 255),
             (cx + 60, cy - 240), (cx + 200, cy - 200), (cx + 310, cy - 110),
@@ -216,7 +236,7 @@ def _test_track_data(track_id, cx, cy):
             (cx - 380, cy + 40),
         ], 72
 
-    # track_id 3: Maze
+    # track 3
     return [
         (cx - 320, cy - 220), (cx - 140, cy - 250), (cx + 60, cy - 210),
         (cx + 180, cy - 130), (cx + 120, cy - 30), (cx + 220, cy + 40),
@@ -232,6 +252,8 @@ def _test_track_data(track_id, cx, cy):
 #  Track class
 # ==========================================================================
 class Track:
+    SPLINE_DENSITY = 30          # points per control segment
+
     def __init__(self, width=900, height=620, level=1, test_track=0):
         self.width = width
         self.height = height
@@ -254,122 +276,184 @@ class Track:
             pts, self.track_width = _level_data(self.level, cx, cy)
         self.control_points = pts
 
-        # Higher density for smoother curves
-        self.center = catmull_rom(pts, density=30)
+        # -- Spline + analytic tangents ------------------------------------
+        self.center = catmull_rom(pts, density=self.SPLINE_DENSITY)
+        self._tangents = catmull_rom_derivative(pts, density=self.SPLINE_DENSITY)
 
+        # -- Borders -------------------------------------------------------
         self.inner = []
         self.outer = []
+        self._normals = []               # stored for debug
+        self._effective_hw = []           # stored for debug
+        self._problem_indices = []        # indices with detected issues
         self._build_borders()
 
+        # -- Checkpoints ---------------------------------------------------
         self.checkpoints = []
         self._build_checkpoints(35)
 
-        # start position & angle
+        # -- Start ---------------------------------------------------------
         self.start_pos = self.center[0]
         dx = self.center[1][0] - self.center[0][0]
         dy = self.center[1][1] - self.center[0][1]
         self.start_angle = -math.degrees(math.atan2(dy, dx))
 
-        # pre-render
+        # -- Render & mask -------------------------------------------------
         self.surface = None
         self._render()
         self.border_mask = None
         self._build_mask()
 
-    # ------------------------------------------------------------------
-    #  Robust border generation
-    # ------------------------------------------------------------------
+        # -- Self-test (assert in debug) -----------------------------------
+        self._validate_mask()
+
+    # ==================================================================
+    #  1) BORDER GENERATION  (the core fix)
+    # ==================================================================
     def _build_borders(self):
-        """Build inner/outer borders using half-width offset with
-        curvature-adaptive clamping to prevent auto-intersections."""
+        """Build inner/outer borders with full robustness pipeline."""
         n = len(self.center)
-        hw = self.track_width / 2.0          # <<< half-width, not full
-        min_hw = hw * 0.45                    # never shrink below 45% of hw
+        hw = self.track_width / 2.0
+        min_hw = hw * 0.45              # absolute minimum half-width
 
-        # 1) compute smoothed normals
-        normals = _smooth_normals(self.center, window=4)
+        # ---- Step 1: Normals from analytic derivative --------------------
+        raw_normals = []
+        for i in range(n):
+            tx, ty = self._tangents[i]
+            L = math.hypot(tx, ty)
+            if L < 1e-9:
+                # fallback: finite-difference
+                pp = self.center[(i - 1) % n]
+                pn = self.center[(i + 1) % n]
+                tx, ty = pn[0] - pp[0], pn[1] - pp[1]
+                L = math.hypot(tx, ty) or 1.0
+            # normal = 90° CCW from tangent
+            raw_normals.append((-ty / L, tx / L))
 
-        # 2) compute per-point curvature and adaptive half-width
+        # ---- Step 2: Angle-clamp consecutive normals (max 8°) -----------
+        MAX_ANGLE_STEP = math.radians(8.0)
+        normals = list(raw_normals)
+        for _pass in range(3):
+            new_normals = list(normals)
+            for i in range(n):
+                prev = normals[(i - 1) % n]
+                curr = normals[i]
+                nxt  = normals[(i + 1) % n]
+
+                # check angle with previous
+                angle_prev = _angle_between_normals(prev, curr)
+                angle_next = _angle_between_normals(curr, nxt)
+
+                if angle_prev > MAX_ANGLE_STEP or angle_next > MAX_ANGLE_STEP:
+                    # blend with neighbours
+                    avg_x = 0.25 * prev[0] + 0.50 * curr[0] + 0.25 * nxt[0]
+                    avg_y = 0.25 * prev[1] + 0.50 * curr[1] + 0.25 * nxt[1]
+                    L = math.hypot(avg_x, avg_y) or 1.0
+                    new_normals[i] = (avg_x / L, avg_y / L)
+            normals = new_normals
+        self._normals = normals
+
+        # ---- Step 3: Curvature-adaptive half-width -----------------------
         adaptive_hw = []
         for i in range(n):
             curv = _curvature_at(self.center, i)
             if curv > 1e-6:
-                # max offset before inner border crosses center = 1/curvature
-                max_offset = 0.85 / curv      # 85% of radius
+                max_offset = 0.85 / curv
                 effective = min(hw, max_offset)
                 effective = max(effective, min_hw)
             else:
                 effective = hw
             adaptive_hw.append(effective)
 
-        # 3) smooth the adaptive hw to avoid abrupt width changes
-        smoothed_hw = list(adaptive_hw)
-        for _pass in range(3):
-            tmp = list(smoothed_hw)
+        # ---- Step 4: Laplacian smoothing (5 passes) ----------------------
+        smoothed = list(adaptive_hw)
+        for _pass in range(5):
+            tmp = list(smoothed)
             for i in range(n):
-                prev_hw = tmp[(i - 1) % n]
-                next_hw = tmp[(i + 1) % n]
-                smoothed_hw[i] = 0.25 * prev_hw + 0.5 * tmp[i] + 0.25 * next_hw
-            # re-clamp
+                smoothed[i] = (0.2 * tmp[(i - 2) % n] +
+                               0.2 * tmp[(i - 1) % n] +
+                               0.2 * tmp[i] +
+                               0.2 * tmp[(i + 1) % n] +
+                               0.2 * tmp[(i + 2) % n])
             for i in range(n):
-                smoothed_hw[i] = max(min_hw, min(hw, smoothed_hw[i]))
+                smoothed[i] = max(min_hw, min(hw, smoothed[i]))
+        self._effective_hw = smoothed
 
-        # 4) build raw borders
+        # ---- Step 5: Build raw borders -----------------------------------
         self.inner = []
         self.outer = []
         for i in range(n):
-            cx, cy = self.center[i]
+            cx_, cy_ = self.center[i]
             nx, ny = normals[i]
-            h = smoothed_hw[i]
-            self.inner.append((cx + nx * h, cy + ny * h))
-            self.outer.append((cx - nx * h, cy - ny * h))
+            h = smoothed[i]
+            assert h > 0, f"Negative effective hw at index {i}: {h}"
+            self.inner.append((cx_ + nx * h, cy_ + ny * h))
+            self.outer.append((cx_ - nx * h, cy_ - ny * h))
 
-        # 5) fix remaining self-intersections by checking adjacent quads
-        self._fix_border_intersections()
+        # ---- Step 6: Fix bow-tie quads + non-adjacent intersections ------
+        self._fix_quads()
 
-    def _fix_border_intersections(self):
-        """Post-process: if adjacent border segments cross, pull them
-        back toward the centerline."""
+    def _fix_quads(self):
+        """Detect and fix bow-tie quads (crossed edges) and nearby
+        intersections by pulling borders toward the centerline."""
         n = len(self.inner)
-        max_iters = 3
-        for _ in range(max_iters):
-            fixed = 0
+        self._problem_indices = []
+
+        for iteration in range(5):
+            problems = []
             for i in range(n):
                 j = (i + 1) % n
+                # Check if the road quad [inner_i, inner_j, outer_j, outer_i]
+                # is a bow-tie (opposite edges cross)
+                if _quad_is_bowtie(self.inner[i], self.inner[j],
+                                   self.outer[j], self.outer[i]):
+                    problems.append(i)
+                    problems.append(j)
 
-                # check inner side
-                if i >= 2:
-                    prev = (i - 1) % n
-                    if _segments_intersect(self.inner[prev], self.inner[i],
-                                           self.inner[i], self.inner[j]):
-                        # pull point i toward center
-                        cx, cy = self.center[i]
-                        ix, iy = self.inner[i]
-                        self.inner[i] = (cx + (ix - cx) * 0.7,
-                                         cy + (iy - cy) * 0.7)
-                        ox, oy = self.outer[i]
-                        self.outer[i] = (cx + (ox - cx) * 0.7,
-                                         cy + (oy - cy) * 0.7)
-                        fixed += 1
+                # Check inner edge i→j vs inner edge j→j+1
+                k = (j + 1) % n
+                if _segments_intersect(self.inner[i], self.inner[j],
+                                       self.inner[j], self.inner[k]):
+                    problems.append(j)
+                if _segments_intersect(self.outer[i], self.outer[j],
+                                       self.outer[j], self.outer[k]):
+                    problems.append(j)
 
-                # check outer side
-                if i >= 2:
-                    prev = (i - 1) % n
-                    if _segments_intersect(self.outer[prev], self.outer[i],
-                                           self.outer[i], self.outer[j]):
-                        cx, cy = self.center[i]
-                        ix, iy = self.inner[i]
-                        self.inner[i] = (cx + (ix - cx) * 0.7,
-                                         cy + (iy - cy) * 0.7)
-                        ox, oy = self.outer[i]
-                        self.outer[i] = (cx + (ox - cx) * 0.7,
-                                         cy + (oy - cy) * 0.7)
-                        fixed += 1
-
-            if fixed == 0:
+            if not problems:
                 break
 
-    # -- checkpoints -------------------------------------------------------
+            # De-duplicate
+            problem_set = set(problems)
+            self._problem_indices.extend(problem_set)
+
+            # Pull each problem point 30% toward center
+            for idx in problem_set:
+                cx_, cy_ = self.center[idx]
+                ix, iy = self.inner[idx]
+                ox, oy = self.outer[idx]
+                self.inner[idx] = (cx_ + (ix - cx_) * 0.7,
+                                   cy_ + (iy - cy_) * 0.7)
+                self.outer[idx] = (cx_ + (ox - cx_) * 0.7,
+                                   cy_ + (oy - cy_) * 0.7)
+
+            # Also smooth neighbours of problem points
+            for idx in problem_set:
+                for delta in [-1, 1]:
+                    ni = (idx + delta) % n
+                    if ni not in problem_set:
+                        cx_, cy_ = self.center[ni]
+                        ix, iy = self.inner[ni]
+                        ox, oy = self.outer[ni]
+                        self.inner[ni] = (cx_ + (ix - cx_) * 0.9,
+                                          cy_ + (iy - cy_) * 0.9)
+                        self.outer[ni] = (cx_ + (ox - cx_) * 0.9,
+                                          cy_ + (oy - cy_) * 0.9)
+
+        self._problem_indices = list(set(self._problem_indices))
+
+    # ==================================================================
+    #  2) CHECKPOINTS
+    # ==================================================================
     def _build_checkpoints(self, num):
         n = len(self.center)
         step = max(1, n // num)
@@ -377,52 +461,42 @@ class Track:
             idx = (i * step) % n
             self.checkpoints.append((self.inner[idx], self.outer[idx], idx))
 
-    # -- rendering ---------------------------------------------------------
+    # ==================================================================
+    #  3) RENDERING  (decorations never affect mask)
+    # ==================================================================
     def _render(self):
         s = pygame.Surface((self.width, self.height))
+        n = len(self.inner)
 
-        # 1) grass background
+        # 1) grass
         for row in range(0, self.height, 16):
             color = GRASS_1 if (row // 16) % 2 == 0 else GRASS_2
             pygame.draw.rect(s, color, (0, row, self.width, 16))
 
-        n = len(self.inner)
-
-        # 2) sand run-off (use actual borders + extra margin)
+        # 2) sand run-off
         sand_extra = 12
         for i in range(n):
             j = (i + 1) % n
-            # direction from center to inner/outer, extend it
-            ci = self.center[i]
-            cj = self.center[j]
+            ci, cj = self.center[i], self.center[j]
+            ni, nj = self._normals[i], self._normals[j]
+            hi, hj = self._effective_hw[i], self._effective_hw[j]
+            si_i = (ci[0] + ni[0] * (hi + sand_extra),
+                    ci[1] + ni[1] * (hi + sand_extra))
+            so_i = (ci[0] - ni[0] * (hi + sand_extra),
+                    ci[1] - ni[1] * (hi + sand_extra))
+            ei_j = (cj[0] + nj[0] * (hj + sand_extra),
+                    cj[1] + nj[1] * (hj + sand_extra))
+            eo_j = (cj[0] - nj[0] * (hj + sand_extra),
+                    cj[1] - nj[1] * (hj + sand_extra))
+            pygame.draw.polygon(s, SAND, [si_i, ei_j, eo_j, so_i])
 
-            di_x, di_y = self.inner[i][0] - ci[0], self.inner[i][1] - ci[1]
-            do_x, do_y = self.outer[i][0] - ci[0], self.outer[i][1] - ci[1]
-            li = math.hypot(di_x, di_y) or 1
-            lo = math.hypot(do_x, do_y) or 1
-
-            dj_x, dj_y = self.inner[j][0] - cj[0], self.inner[j][1] - cj[1]
-            doj_x, doj_y = self.outer[j][0] - cj[0], self.outer[j][1] - cj[1]
-            lj = math.hypot(dj_x, dj_y) or 1
-            loj = math.hypot(doj_x, doj_y) or 1
-
-            si = (self.inner[i][0] + di_x / li * sand_extra,
-                  self.inner[i][1] + di_y / li * sand_extra)
-            so = (self.outer[i][0] + do_x / lo * sand_extra,
-                  self.outer[i][1] + do_y / lo * sand_extra)
-            ei = (self.inner[j][0] + dj_x / lj * sand_extra,
-                  self.inner[j][1] + dj_y / lj * sand_extra)
-            eo = (self.outer[j][0] + doj_x / loj * sand_extra,
-                  self.outer[j][1] + doj_y / loj * sand_extra)
-            pygame.draw.polygon(s, SAND, [si, ei, eo, so])
-
-        # 3) main asphalt
+        # 3) main asphalt (quads from inner/outer borders)
         for i in range(n):
             j = (i + 1) % n
             quad = [self.inner[i], self.inner[j], self.outer[j], self.outer[i]]
             pygame.draw.polygon(s, ASPHALT, quad)
 
-        # 4) asphalt texture lines
+        # 4) asphalt texture
         for i in range(0, n, 4):
             j = (i + 1) % n
             mid_i = ((self.inner[i][0] + self.outer[i][0]) / 2,
@@ -431,43 +505,25 @@ class Track:
                      (self.inner[j][1] + self.outer[j][1]) / 2)
             pygame.draw.line(s, ASPHALT_LT, mid_i, mid_j, 1)
 
-        # 5) kerbs -- drawn using per-segment normals from borders
+        # 5) kerbs (per-vertex normals for coherent strips)
         kerb_w = 5
         for i in range(n):
             seg = i % 8
             c_k = KERB_RED if seg < 4 else KERB_WHITE
             j = (i + 1) % n
 
-            # inner kerb: strip just inside the inner border
-            ci = self.center[i]
+            # inner kerb
+            ni_x, ni_y = self._normals[i]
+            nj_x, nj_y = self._normals[j]
             ii, ij = self.inner[i], self.inner[j]
-            dx_i = ii[0] - ci[0]
-            dy_i = ii[1] - ci[1]
-            li = math.hypot(dx_i, dy_i) or 1
-            nxi, nyi = dx_i / li, dy_i / li
-            ki1 = (ii[0] - nxi * kerb_w, ii[1] - nyi * kerb_w)
-
-            cj = self.center[j]
-            dx_j = ij[0] - cj[0]
-            dy_j = ij[1] - cj[1]
-            lj = math.hypot(dx_j, dy_j) or 1
-            nxj, nyj = dx_j / lj, dy_j / lj
-            ki2 = (ij[0] - nxj * kerb_w, ij[1] - nyj * kerb_w)
+            ki1 = (ii[0] - ni_x * kerb_w, ii[1] - ni_y * kerb_w)
+            ki2 = (ij[0] - nj_x * kerb_w, ij[1] - nj_y * kerb_w)
             pygame.draw.polygon(s, c_k, [ii, ij, ki2, ki1])
 
             # outer kerb
             oi, oj = self.outer[i], self.outer[j]
-            dx_o = oi[0] - ci[0]
-            dy_o = oi[1] - ci[1]
-            lo = math.hypot(dx_o, dy_o) or 1
-            nxo, nyo = dx_o / lo, dy_o / lo
-            ko1 = (oi[0] - nxo * kerb_w, oi[1] - nyo * kerb_w)
-
-            dx_oj = oj[0] - cj[0]
-            dy_oj = oj[1] - cj[1]
-            loj = math.hypot(dx_oj, dy_oj) or 1
-            nxoj, nyoj = dx_oj / loj, dy_oj / loj
-            ko2 = (oj[0] - nxoj * kerb_w, oj[1] - nyoj * kerb_w)
+            ko1 = (oi[0] + ni_x * kerb_w, oi[1] + ni_y * kerb_w)
+            ko2 = (oj[0] + nj_x * kerb_w, oj[1] + nj_y * kerb_w)
             pygame.draw.polygon(s, c_k, [oi, oj, ko2, ko1])
 
         # 6) white edge lines
@@ -486,10 +542,10 @@ class Track:
             dx = outer[0] - inner[0]
             dy = outer[1] - inner[1]
             L = math.hypot(dx, dy) or 1
-            num_squares = 8
-            for k in range(num_squares):
-                t1 = k / num_squares
-                t2 = (k + 1) / num_squares
+            num_sq = 8
+            for k in range(num_sq):
+                t1 = k / num_sq
+                t2 = (k + 1) / num_sq
                 p1 = (inner[0] + dx * t1, inner[1] + dy * t1)
                 p2 = (inner[0] + dx * t2, inner[1] + dy * t2)
                 color = FINISH_W if k % 2 == 0 else FINISH_B
@@ -504,14 +560,15 @@ class Track:
 
         self.surface = s
 
-    # -- collision mask (polygon-fill approach) ----------------------------
+    # ==================================================================
+    #  4) COLLISION MASK  (road polygon ONLY, no decorations)
+    # ==================================================================
     def _build_mask(self):
-        """Build collision mask from the road polygon.
-        White = off-track, Black = on-track."""
+        """Mask: white=off-track, black=on-track.
+        Built ONLY from the inner/outer road polygon quads."""
         ms = pygame.Surface((self.width, self.height))
         ms.fill(WHITE)
 
-        # Draw the road as a filled polygon using quads
         n = len(self.inner)
         for i in range(n):
             j = (i + 1) % n
@@ -521,6 +578,26 @@ class Track:
 
         self.border_mask = pygame.mask.from_threshold(ms, WHITE, (10, 10, 10))
 
+    # ==================================================================
+    #  5) VALIDATION
+    # ==================================================================
+    def _validate_mask(self):
+        """Check that every centerline point is on-track.
+        If any point is off-track, it indicates a mask/border bug."""
+        problems = 0
+        for i, (px, py) in enumerate(self.center):
+            ix, iy = int(px), int(py)
+            if 0 <= ix < self.width and 0 <= iy < self.height:
+                if self.border_mask.get_at((ix, iy)):
+                    problems += 1
+
+        if problems > 0:
+            print(f"  [TRACK WARN] {problems}/{len(self.center)} centerline "
+                  f"points are off-track on {self.level_name} -- check borders!")
+
+    # ==================================================================
+    #  6) PUBLIC API
+    # ==================================================================
     def is_off_track(self, x, y):
         ix, iy = int(x), int(y)
         if ix < 0 or ix >= self.width or iy < 0 or iy >= self.height:
@@ -534,4 +611,56 @@ class Track:
         overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
         for cp in self.checkpoints:
             pygame.draw.line(overlay, (*CHECKPOINT_CLR, alpha), cp[0], cp[1], 1)
+        screen.blit(overlay, (0, 0))
+
+    # ==================================================================
+    #  7) DEBUG OVERLAY
+    # ==================================================================
+    def draw_debug(self, screen):
+        """Draw debug overlay: centerline, normals, borders, problems."""
+        overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        n = len(self.center)
+
+        # centerline
+        pts_c = [(int(p[0]), int(p[1])) for p in self.center]
+        if len(pts_c) >= 2:
+            pygame.draw.lines(overlay, (*DBG_CENTER, 120), True, pts_c, 1)
+
+        # inner border
+        pts_i = [(int(p[0]), int(p[1])) for p in self.inner]
+        if len(pts_i) >= 2:
+            pygame.draw.lines(overlay, (*DBG_INNER, 150), True, pts_i, 1)
+
+        # outer border
+        pts_o = [(int(p[0]), int(p[1])) for p in self.outer]
+        if len(pts_o) >= 2:
+            pygame.draw.lines(overlay, (*DBG_OUTER, 150), True, pts_o, 1)
+
+        # normals (every 10th point)
+        norm_len = 15
+        for i in range(0, n, 10):
+            cx_, cy_ = self.center[i]
+            nx, ny = self._normals[i]
+            ex = cx_ + nx * norm_len
+            ey = cy_ + ny * norm_len
+            pygame.draw.line(overlay, (*DBG_NORMAL, 100),
+                             (int(cx_), int(cy_)), (int(ex), int(ey)), 1)
+
+        # problem zones (red circles)
+        for idx in self._problem_indices:
+            px, py = self.center[idx]
+            pygame.draw.circle(overlay, (*DBG_PROBLEM, 180),
+                               (int(px), int(py)), 6, 2)
+
+        # effective half-width markers (every 20th point)
+        for i in range(0, n, 20):
+            cx_, cy_ = self.center[i]
+            hw = self._effective_hw[i]
+            max_hw = self.track_width / 2.0
+            ratio = hw / max_hw
+            if ratio < 0.8:
+                # orange = narrowed
+                c = (255, int(165 * ratio), 0, 150)
+                pygame.draw.circle(overlay, c, (int(cx_), int(cy_)), 4, 1)
+
         screen.blit(overlay, (0, 0))

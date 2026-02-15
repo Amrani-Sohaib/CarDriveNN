@@ -109,6 +109,7 @@ class GUI:
 
         self.fps = 60
         self.show_radars = True
+        self.debug_track = False
         self.paused = False
         self.speed = 1
         self.save_requested = False
@@ -175,6 +176,8 @@ class GUI:
                     self.speed = min(20, self.speed + 1)
                 if ev.key == pygame.K_DOWN:
                     self.speed = max(1, self.speed - 1)
+                if ev.key == pygame.K_d:
+                    self.debug_track = not self.debug_track
                 if ev.key == pygame.K_s and not self.test_mode:
                     self.save_requested = True
                     self.save_flash = 90
@@ -207,6 +210,8 @@ class GUI:
         self.track_surface.fill(BG)
         track.draw(self.track_surface)
         track.draw_checkpoints(self.track_surface)
+        if self.debug_track:
+            track.draw_debug(self.track_surface)
         if car:
             car.draw(self.track_surface, show_radars=self.show_radars)
 
@@ -381,13 +386,13 @@ class GUI:
         self._hsep(self.screen, x, y, usable); y += int(4 * s)
         clh = int(12 * s)
         if self.test_mode:
-            for t in ["SPC:Pause R:Radar", "Up/Dn:Speed N:Next", "ESC:Quit"]:
+            for t in ["SPC:Pause R:Radar D:Debug", "Up/Dn:Speed N:Next", "ESC:Quit"]:
                 self._blit(self.screen, self._font_nn_sm_main, t, TEXT_DIM, x, y)
                 y += clh
             y += int(4 * s)
             self._blit(self.screen, self._font_md, "TEST MODE", PPO_BLUE, x, y)
         else:
-            for t in ["SPC:Pause R:Radar S:Save", "Up/Dn:Speed ESC:Quit"]:
+            for t in ["SPC:Pause R:Radar D:Debug", "S:Save Up/Dn:Speed ESC:Quit"]:
                 self._blit(self.screen, self._font_nn_sm_main, t, TEXT_DIM, x, y)
                 y += clh
 
