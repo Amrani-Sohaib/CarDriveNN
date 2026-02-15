@@ -139,7 +139,7 @@ def _level_data(level, cx, cy):
             (cx + 280, cy + 15), (cx + 250, cy + 125), (cx + 115, cy + 195),
             (cx - 25, cy + 210), (cx - 155, cy + 180), (cx - 265, cy + 95),
             (cx - 280, cy - 25), (cx - 240, cy - 140), (cx - 115, cy - 195),
-        ], 64
+        ], 100
 
     if level == 2:
         # S-Curve
@@ -149,7 +149,7 @@ def _level_data(level, cx, cy):
             (cx + 80, cy + 220), (cx - 45, cy + 240), (cx - 170, cy + 200),
             (cx - 290, cy + 120), (cx - 320, cy + 15), (cx - 285, cy - 120),
             (cx - 165, cy - 210),
-        ], 56
+        ], 90
 
     if level == 3:
         # Chicane -- wider curves than before to avoid crossing
@@ -161,7 +161,7 @@ def _level_data(level, cx, cy):
             (cx - 100, cy + 245), (cx - 220, cy + 175),
             (cx - 330, cy + 90), (cx - 340, cy - 30),
             (cx - 280, cy - 135), (cx - 175, cy - 220),
-        ], 44
+        ], 80
 
     if level == 4:
         # Hairpin -- generous spacing between switchbacks
@@ -175,7 +175,7 @@ def _level_data(level, cx, cy):
             (cx - 370, cy + 110), (cx - 335, cy + 5),
             (cx - 275, cy - 75), (cx - 350, cy - 170),
             (cx - 280, cy - 245),
-        ], 36
+        ], 70
 
     # level 5 -- Infernal, but with enough spacing
     return [
@@ -186,7 +186,7 @@ def _level_data(level, cx, cy):
         (cx - 120, cy + 215), (cx - 260, cy + 270), (cx - 370, cy + 190),
         (cx - 325, cy + 95), (cx - 175, cy + 65), (cx - 300, cy - 30),
         (cx - 395, cy - 110), (cx - 325, cy - 220), (cx - 170, cy - 250),
-    ], 32
+    ], 62
 
 
 def _test_track_data(track_id, cx, cy):
@@ -202,7 +202,7 @@ def _test_track_data(track_id, cx, cy):
             (cx + 50, cy + 30), (cx - 70, cy + 130), (cx - 210, cy + 200),
             (cx - 340, cy + 230), (cx - 380, cy + 150), (cx - 300, cy + 50),
             (cx - 160, cy - 50), (cx - 30, cy - 150), (cx - 120, cy - 210),
-        ], 40
+        ], 72
 
     if track_id == 2:
         # Riverside
@@ -214,7 +214,7 @@ def _test_track_data(track_id, cx, cy):
             (cx + 180, cy + 60), (cx + 200, cy + 160), (cx + 100, cy + 240),
             (cx - 60, cy + 260), (cx - 200, cy + 220), (cx - 320, cy + 140),
             (cx - 380, cy + 40),
-        ], 40
+        ], 72
 
     # track_id 3: Maze
     return [
@@ -225,7 +225,7 @@ def _test_track_data(track_id, cx, cy):
         (cx, cy + 260), (cx - 140, cy + 210), (cx - 80, cy + 120),
         (cx - 200, cy + 60), (cx - 340, cy + 120), (cx - 380, cy + 20),
         (cx - 340, cy - 100), (cx - 220, cy - 160),
-    ], 36
+    ], 68
 
 
 # ==========================================================================
