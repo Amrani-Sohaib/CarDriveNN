@@ -214,26 +214,26 @@ def _level_data(level, cx, cy):
 def _test_track_data(track_id, cx, cy):
     """Return (control_points, track_width) for test circuits."""
     if track_id == 1:
+        # Technical circuit with tight esses — NO self-crossing centerline
         return [
-            (cx - 60, cy - 250), (cx + 160, cy - 240), (cx + 320, cy - 160),
-            (cx + 370, cy - 40), (cx + 290, cy + 60), (cx + 120, cy + 40),
-            (cx - 20, cy - 40), (cx - 160, cy + 50), (cx - 310, cy + 70),
-            (cx - 380, cy - 10), (cx - 340, cy - 120), (cx - 220, cy - 200),
-            (cx - 100, cy - 240), (cx + 40, cy - 200), (cx + 130, cy - 80),
-            (cx + 50, cy + 30), (cx - 70, cy + 130), (cx - 210, cy + 200),
-            (cx - 340, cy + 230), (cx - 380, cy + 150), (cx - 300, cy + 50),
-            (cx - 160, cy - 50), (cx - 30, cy - 150), (cx - 120, cy - 210),
+            (cx - 30, cy - 260), (cx + 180, cy - 250), (cx + 340, cy - 170),
+            (cx + 390, cy - 30), (cx + 340, cy + 80), (cx + 180, cy + 50),
+            (cx + 50, cy + 130), (cx + 180, cy + 220), (cx + 340, cy + 260),
+            (cx + 180, cy + 280), (cx + 20, cy + 230), (cx - 100, cy + 270),
+            (cx - 260, cy + 240), (cx - 370, cy + 150), (cx - 390, cy + 20),
+            (cx - 340, cy - 80), (cx - 200, cy - 50), (cx - 280, cy - 160),
+            (cx - 200, cy - 240),
         ], 72
 
     if track_id == 2:
+        # Riverside circuit with flowing curves — NO self-crossing centerline
         return [
             (cx - 350, cy - 60), (cx - 280, cy - 200), (cx - 120, cy - 255),
             (cx + 60, cy - 240), (cx + 200, cy - 200), (cx + 310, cy - 110),
-            (cx + 380, cy + 10), (cx + 360, cy + 120), (cx + 260, cy + 180),
-            (cx + 120, cy + 150), (cx + 60, cy + 80), (cx + 100, cy + 20),
-            (cx + 180, cy + 60), (cx + 200, cy + 160), (cx + 100, cy + 240),
-            (cx - 60, cy + 260), (cx - 200, cy + 220), (cx - 320, cy + 140),
-            (cx - 380, cy + 40),
+            (cx + 380, cy + 10), (cx + 360, cy + 130), (cx + 220, cy + 200),
+            (cx + 80, cy + 150), (cx - 50, cy + 200), (cx + 50, cy + 270),
+            (cx - 60, cy + 280), (cx - 200, cy + 230), (cx - 320, cy + 140),
+            (cx - 390, cy + 40),
         ], 72
 
     # track 3
@@ -377,6 +377,47 @@ class Track:
                                0.2 * tmp[(i + 2) % n])
             for i in range(n):
                 smoothed[i] = max(min_hw, min(hw, smoothed[i]))
+        # ---- Step 4b: Proximity clamping (prevent self-overlap) --------
+        #  When two parts of the centerline pass close to each other
+        #  (e.g. tight chicane), reduce half-widths so borders don't cross.
+        MIN_SPLINE_SEP = max(n // 8, 20)   # must be far on spline
+        MARGIN = 0.85                       # hw_i + hw_j <= dist * MARGIN
+        for _prox_pass in range(3):         # multiple passes for convergence
+            changed = False
+            for i in range(n):
+                ci_x, ci_y = self.center[i]
+                for j in range(i + MIN_SPLINE_SEP,
+                               i + n - MIN_SPLINE_SEP + 1):
+                    jj = j % n
+                    cj_x, cj_y = self.center[jj]
+                    dist = math.hypot(ci_x - cj_x, ci_y - cj_y)
+                    if dist < 1e-3:
+                        continue
+                    total_hw = smoothed[i] + smoothed[jj]
+                    if total_hw > dist * MARGIN:
+                        # Scale both down proportionally
+                        ratio = (dist * MARGIN) / total_hw
+                        new_i = max(min_hw, smoothed[i] * ratio)
+                        new_j = max(min_hw, smoothed[jj] * ratio)
+                        if new_i < smoothed[i] - 0.1 or new_j < smoothed[jj] - 0.1:
+                            changed = True
+                        smoothed[i] = min(smoothed[i], new_i)
+                        smoothed[jj] = min(smoothed[jj], new_j)
+            if not changed:
+                break
+
+        # Re-smooth after proximity clamping (2 light passes)
+        for _pass in range(2):
+            tmp = list(smoothed)
+            for i in range(n):
+                smoothed[i] = (0.15 * tmp[(i - 2) % n] +
+                               0.20 * tmp[(i - 1) % n] +
+                               0.30 * tmp[i] +
+                               0.20 * tmp[(i + 1) % n] +
+                               0.15 * tmp[(i + 2) % n])
+            for i in range(n):
+                smoothed[i] = max(min_hw, min(hw, smoothed[i]))
+
         self._effective_hw = smoothed
 
         # ---- Step 5: Build raw borders -----------------------------------
@@ -394,23 +435,23 @@ class Track:
         self._fix_quads()
 
     def _fix_quads(self):
-        """Detect and fix bow-tie quads (crossed edges) and nearby
-        intersections by pulling borders toward the centerline."""
+        """Detect and fix bow-tie quads, adjacent intersections,
+        AND non-adjacent border crossings."""
         n = len(self.inner)
         self._problem_indices = []
+        MIN_SPLINE_SEP = max(n // 8, 20)
 
-        for iteration in range(5):
+        for iteration in range(12):
             problems = []
+
+            # --- A) Bow-ties + adjacent crossings -------------------------
             for i in range(n):
                 j = (i + 1) % n
-                # Check if the road quad [inner_i, inner_j, outer_j, outer_i]
-                # is a bow-tie (opposite edges cross)
                 if _quad_is_bowtie(self.inner[i], self.inner[j],
                                    self.outer[j], self.outer[i]):
                     problems.append(i)
                     problems.append(j)
 
-                # Check inner edge i→j vs inner edge j→j+1
                 k = (j + 1) % n
                 if _segments_intersect(self.inner[i], self.inner[j],
                                        self.inner[j], self.inner[k]):
@@ -419,35 +460,52 @@ class Track:
                                        self.outer[j], self.outer[k]):
                     problems.append(j)
 
+            # --- B) Non-adjacent crossings --------------------------------
+            #  Check inner[i]→inner[i+1] vs inner[j]→inner[j+1]
+            #  for j far from i on the spline.
+            for i in range(n):
+                i1 = (i + 1) % n
+                for delta in range(MIN_SPLINE_SEP,
+                                   n - MIN_SPLINE_SEP + 1):
+                    j = (i + delta) % n
+                    j1 = (j + 1) % n
+                    if _segments_intersect(self.inner[i], self.inner[i1],
+                                           self.inner[j], self.inner[j1]):
+                        problems.extend([i, i1, j, j1])
+                    if _segments_intersect(self.outer[i], self.outer[i1],
+                                           self.outer[j], self.outer[j1]):
+                        problems.extend([i, i1, j, j1])
+
             if not problems:
                 break
 
-            # De-duplicate
             problem_set = set(problems)
             self._problem_indices.extend(problem_set)
 
-            # Pull each problem point 30% toward center
+            # Pull each problem point toward center
+            shrink = 0.60 if iteration < 4 else 0.45
             for idx in problem_set:
                 cx_, cy_ = self.center[idx]
                 ix, iy = self.inner[idx]
                 ox, oy = self.outer[idx]
-                self.inner[idx] = (cx_ + (ix - cx_) * 0.7,
-                                   cy_ + (iy - cy_) * 0.7)
-                self.outer[idx] = (cx_ + (ox - cx_) * 0.7,
-                                   cy_ + (oy - cy_) * 0.7)
+                self.inner[idx] = (cx_ + (ix - cx_) * shrink,
+                                   cy_ + (iy - cy_) * shrink)
+                self.outer[idx] = (cx_ + (ox - cx_) * shrink,
+                                   cy_ + (oy - cy_) * shrink)
 
-            # Also smooth neighbours of problem points
+            # Smooth neighbours
             for idx in problem_set:
-                for delta in [-1, 1]:
+                for delta in [-2, -1, 1, 2]:
                     ni = (idx + delta) % n
                     if ni not in problem_set:
                         cx_, cy_ = self.center[ni]
                         ix, iy = self.inner[ni]
                         ox, oy = self.outer[ni]
-                        self.inner[ni] = (cx_ + (ix - cx_) * 0.9,
-                                          cy_ + (iy - cy_) * 0.9)
-                        self.outer[ni] = (cx_ + (ox - cx_) * 0.9,
-                                          cy_ + (oy - cy_) * 0.9)
+                        f = 0.92 if abs(delta) == 1 else 0.96
+                        self.inner[ni] = (cx_ + (ix - cx_) * f,
+                                          cy_ + (iy - cy_) * f)
+                        self.outer[ni] = (cx_ + (ox - cx_) * f,
+                                          cy_ + (oy - cy_) * f)
 
         self._problem_indices = list(set(self._problem_indices))
 
